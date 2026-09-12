@@ -154,7 +154,22 @@ jobs:
                   pkg-config libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
                   libavfilter-dev libswscale-dev libswresample-dev &&
                 pip install --upgrade pip wheel &&
-                pip wheel '${{ matrix.package }}' -w /output --no-deps
+                PKG='${{ matrix.package }}' &&
+                case \"\$PKG\" in
+                  av==17.0.1)
+                    # This exact av release fails to Cythonize against
+                    # newer Cython (>=3.1) due to a strict redeclaration
+                    # check; fixed upstream in a later PyAV release via
+                    # @cython.final annotations. Scoped to this exact
+                    # version so the workaround stops applying once HA
+                    # bumps to a fixed av release.
+                    pip install 'cython<3.1' &&
+                    pip wheel \"\$PKG\" -w /output --no-deps --no-build-isolation
+                    ;;
+                  *)
+                    pip wheel \"\$PKG\" -w /output --no-deps
+                    ;;
+                esac
               "
 
       - uses: actions/upload-artifact@v4
