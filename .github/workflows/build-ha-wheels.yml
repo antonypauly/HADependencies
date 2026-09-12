@@ -50,7 +50,6 @@ jobs:
         with:
           name: requirements
           path: requirements_all.txt
-          archive: false
 
   # ---------------------------------------------------------------
   # 2. Detect which packages have NO existing armv7/cp314 wheel
@@ -74,6 +73,7 @@ jobs:
             -v "$PWD":/work -w /work \
             python:${{ needs.config.outputs.py_version }}-slim-bookworm \
             bash -c "
+              ls -l &&
               pip install --root-user-action=ignore --upgrade pip &&
               pip download --no-deps --dest /tmp/check \
                 --only-binary=:all: \
