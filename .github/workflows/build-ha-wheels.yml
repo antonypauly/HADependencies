@@ -76,8 +76,7 @@ jobs:
               ls -l &&
               pip install --root-user-action=ignore --upgrade pip &&
               pip download --no-deps --dest /tmp/check \
-                --only-binary=:all: \
-                -r requirements_all.txt \
+                --only-binary=:all: -r requirements_all.txt \
                 > pip_download.log 2>&1 || true
             "
           cat pip_download.log || true
