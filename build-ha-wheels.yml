@@ -1,0 +1,153 @@
+name: Build HA Wheels for armv7
+
+on:
+  push:
+    paths:
+      - 'build-config.yaml'
+  workflow_dispatch:
+    inputs:
+      homeassistant_version:
+        description: 'HA version to build wheels for (overrides build-config.yaml if set)'
+        required: false
+
+env:
+  TARGET_PLATFORM: linux/arm/v7
+  WHEEL_PLATFORM_TAG: linux_armv7l   # glibc tag, matches DietPi (Debian-based)
+
+jobs:
+  # ---------------------------------------------------------------
+  # 1. Read config + fetch the exact requirements file for that HA version
+  # ---------------------------------------------------------------
+  config:
+    runs-on: ubuntu-latest
+    outputs:
+      ha_version: ${{ steps.set.outputs.ha_version }}
+      py_version: ${{ steps.set.outputs.py_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yq
+        run: sudo snap install yq
+
+      - name: Resolve target versions
+        id: set
+        run: |
+          if [ -n "${{ github.event.inputs.homeassistant_version }}" ]; then
+            HA_VERSION="${{ github.event.inputs.homeassistant_version }}"
+          else
+            HA_VERSION=$(yq '.homeassistant_version' build-config.yaml)
+          fi
+          PY_VERSION=$(yq '.python_version' build-config.yaml)
+          echo "ha_version=$HA_VERSION" >> "$GITHUB_OUTPUT"
+          echo "py_version=$PY_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch requirements_all.txt for this HA version
+        run: |
+          curl -fsSL -o requirements_all.txt \
+            "https://raw.githubusercontent.com/home-assistant/core/${{ steps.set.outputs.ha_version }}/requirements_all.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: requirements
+          path: requirements_all.txt
+
+  # ---------------------------------------------------------------
+  # 2. Detect which packages have NO existing armv7/cp314 wheel
+  # ---------------------------------------------------------------
+  detect:
+    needs: config
+    runs-on: ubuntu-latest
+    outputs:
+      to_build: ${{ steps.parse.outputs.to_build }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: requirements
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Run pip download --only-binary check inside armv7 container
+        run: |
+          docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
+            -v "$PWD":/work -w /work \
+            python:${{ needs.config.outputs.py_version }}-slim-bookworm \
+            bash -c "
+              pip install --root-user-action=ignore --upgrade pip &&
+              pip download --no-deps --dest /tmp/check \
+                --only-binary=:all: \
+                -r requirements_all.txt \
+                > pip_download.log 2>&1 || true
+            "
+          cat pip_download.log || true
+
+      - name: Parse failures into a package list
+        id: parse
+        run: |
+          grep -oP "No matching distribution found for \K[^\s]+" pip_download.log \
+            | sed 's/[<>=!~].*//' | sort -u > to_build.txt || true
+          echo "Packages needing a build:"
+          cat to_build.txt
+          # Turn into a JSON array for the build matrix
+          PKGS_JSON=$(jq -R -s -c 'split("\n") | map(select(length > 0))' to_build.txt)
+          echo "to_build=$PKGS_JSON" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: to-build-list
+          path: to_build.txt
+
+  # ---------------------------------------------------------------
+  # 3. Build a wheel for each package that needs one (matrix)
+  # ---------------------------------------------------------------
+  build:
+    needs: [config, detect]
+    if: needs.detect.outputs.to_build != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJson(needs.detect.outputs.to_build) }}
+    steps:
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build wheel for ${{ matrix.package }}
+        run: |
+          mkdir -p output
+          docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
+            -v "$PWD/output":/output \
+            python:${{ needs.config.outputs.py_version }}-bookworm \
+            bash -c "
+              apt-get update && apt-get install -y build-essential gfortran libopenblas-dev &&
+              pip install --upgrade pip wheel &&
+              pip wheel '${{ matrix.package }}' -w /output --no-deps
+            "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.package }}
+          path: output/*.whl
+
+  # ---------------------------------------------------------------
+  # 4. Collect all built wheels and publish as a GitHub Release
+  # ---------------------------------------------------------------
+  publish:
+    needs: [config, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: List built wheels
+        run: ls -la dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ha-wheels-${{ needs.config.outputs.ha_version }}
+          name: HA armv7 wheels — ${{ needs.config.outputs.ha_version }}
+          files: dist/*.whl
+          fail_on_unmatched_files: false
