@@ -99,7 +99,7 @@ jobs:
               continue
             fi
             match=$(echo "$json" | jq -r '.urls[].filename' 2>/dev/null \
-              | grep -E 'py[23]?(\.py3)?-none-any\.whl$|(armv7l).*cp314|cp314.*(armv7l)')
+              | grep -E 'py[23]?(\.py3)?-none-any\.whl$|(armv7l).*cp314|cp314.*(armv7l)|armv7l.*cp3[0-9]+-abi3|cp3[0-9]+-abi3.*armv7l')
             if [ -z "$match" ]; then
               echo "$name==$version" >> to_build.txt
             fi
@@ -138,16 +138,24 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Build wheel for ${{ matrix.package }}
-        run: |
-          mkdir -p output
-          docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
-            -v "$PWD/output":/output \
-            python:${{ needs.config.outputs.py_version }}-bookworm \
-            bash -c "
-              apt-get update && apt-get install -y build-essential gfortran libopenblas-dev &&
-              pip install --upgrade pip wheel &&
-              pip wheel '${{ matrix.package }}' -w /output --no-deps
-            "
+        uses: nick-fields/retry@v3
+        continue-on-error: true
+        with:
+          timeout_minutes: 15
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: |
+            mkdir -p output
+            docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
+              -v "$PWD/output":/output \
+              python:${{ needs.config.outputs.py_version }}-bookworm \
+              bash -c "
+                apt-get update && apt-get install -y build-essential gfortran libopenblas-dev \
+                  pkg-config libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
+                  libavfilter-dev libswscale-dev libswresample-dev &&
+                pip install --upgrade pip wheel &&
+                pip wheel '${{ matrix.package }}' -w /output --no-deps
+              "
 
       - uses: actions/upload-artifact@v4
         with:
@@ -159,6 +167,7 @@ jobs:
   # ---------------------------------------------------------------
   publish:
     needs: [config, build]
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
