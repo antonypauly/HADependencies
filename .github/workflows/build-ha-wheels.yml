@@ -148,7 +148,7 @@ jobs:
             mkdir -p output
             docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
               -v "$PWD/output":/output \
-              python:${{ needs.config.outputs.py_version }}-bookworm \
+              python:${{ needs.config.outputs.py_version }}-trixie \
               bash -c "
                 apt-get update && apt-get install -y build-essential gfortran libopenblas-dev \
                   pkg-config libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
