@@ -41,15 +41,21 @@ jobs:
           echo "ha_version=$HA_VERSION" >> "$GITHUB_OUTPUT"
           echo "py_version=$PY_VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Fetch requirements_all.txt for this HA version
+      - name: Fetch requirements files for this HA version
         run: |
+          # requirements_all.txt starts with "-r requirements.txt", so pip
+          # needs both files present alongside each other to resolve it.
+          curl -fsSL -o requirements.txt \
+            "https://raw.githubusercontent.com/home-assistant/core/${{ steps.set.outputs.ha_version }}/requirements.txt"
           curl -fsSL -o requirements_all.txt \
             "https://raw.githubusercontent.com/home-assistant/core/${{ steps.set.outputs.ha_version }}/requirements_all.txt"
 
       - uses: actions/upload-artifact@v4
         with:
           name: requirements
-          path: requirements_all.txt
+          path: |
+            requirements.txt
+            requirements_all.txt
 
   # ---------------------------------------------------------------
   # 2. Detect which packages have NO existing armv7/cp314 wheel
