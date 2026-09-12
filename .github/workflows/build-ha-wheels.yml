@@ -83,16 +83,19 @@ jobs:
       - name: Check PyPI metadata for a matching armv7/cp314 wheel (no downloads)
         id: parse
         run: |
+          set +e   # individual grep/curl misses are expected here, not fatal
           : > to_build.txt
+          : > needs_review.txt
           while IFS= read -r req; do
             name=$(echo "$req" | grep -oE '^[A-Za-z0-9_.-]+')
             version=$(echo "$req" | grep -oP '(?<===)[0-9][A-Za-z0-9_.\-]*' | head -1)
             if [ -z "$name" ] || [ -z "$version" ]; then
+              echo "$req" >> needs_review.txt
               continue
             fi
             json=$(curl -fsSL "https://pypi.org/pypi/${name}/${version}/json" 2>/dev/null)
             if [ -z "$json" ]; then
-              echo "$name==$version" >> to_build.txt
+              echo "$name==$version" >> needs_review.txt
               continue
             fi
             match=$(echo "$json" | jq -r '.urls[].filename' 2>/dev/null \
@@ -101,10 +104,18 @@ jobs:
               echo "$name==$version" >> to_build.txt
             fi
           done < combined_requirements.txt
+          set -e
           echo "Packages needing a build:"
           cat to_build.txt
+          echo "Skipped/unresolved — check manually:"
+          cat needs_review.txt
           PKGS_JSON=$(jq -R -s -c 'split("\n") | map(select(length > 0))' to_build.txt)
           echo "to_build=$PKGS_JSON" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: needs-review-list
+          path: needs_review.txt
 
       - uses: actions/upload-artifact@v4
         with:
