@@ -75,43 +75,34 @@ jobs:
         with:
           name: requirements
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Run per-package --only-binary check inside armv7 container
+      - name: Build combined package list
         run: |
-          # Checking the whole requirements set as one pip resolution means a
-          # single package with no armv7 wheel (e.g. audioop-lts) triggers
-          # ResolutionImpossible and aborts before other packages are even
-          # checked. Instead, filter out the -r/-c include directives and
-          # test each requirement line independently so failures don't mask
-          # each other.
           grep -vE '^(#|-r |-c |\s*$)' requirements.txt requirements_all.txt \
             | sed 's/^[^:]*://' | sort -u > combined_requirements.txt
 
-          docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
-            -v "$PWD":/work -w /work \
-            python:${{ needs.config.outputs.py_version }}-slim-bookworm \
-            bash -c "
-              pip install --root-user-action=ignore --upgrade pip &&
-              > pip_download.log
-              while IFS= read -r pkg; do
-                echo \"=== \$pkg ===\" >> pip_download.log
-                pip download --no-deps --dest /tmp/check --only-binary=:all: \
-                  -c homeassistant/package_constraints.txt \"\$pkg\" \
-                  >> pip_download.log 2>&1
-              done < combined_requirements.txt
-            "
-          cat pip_download.log || true
-
-      - name: Parse failures into a package list
+      - name: Check PyPI metadata for a matching armv7/cp314 wheel (no downloads)
         id: parse
         run: |
-          grep -oP "No matching distribution found for \K[^\s]+" pip_download.log \
-            | sed 's/[<>=!~].*//' | sort -u > to_build.txt || true
+          : > to_build.txt
+          while IFS= read -r req; do
+            name=$(echo "$req" | grep -oE '^[A-Za-z0-9_.-]+')
+            version=$(echo "$req" | grep -oP '(?<===)[0-9][A-Za-z0-9_.\-]*' | head -1)
+            if [ -z "$name" ] || [ -z "$version" ]; then
+              continue
+            fi
+            json=$(curl -fsSL "https://pypi.org/pypi/${name}/${version}/json" 2>/dev/null)
+            if [ -z "$json" ]; then
+              echo "$name==$version" >> to_build.txt
+              continue
+            fi
+            match=$(echo "$json" | jq -r '.urls[].filename' 2>/dev/null \
+              | grep -E 'py[23]?(\.py3)?-none-any\.whl$|(armv7l).*cp314|cp314.*(armv7l)')
+            if [ -z "$match" ]; then
+              echo "$name==$version" >> to_build.txt
+            fi
+          done < combined_requirements.txt
           echo "Packages needing a build:"
           cat to_build.txt
-          # Turn into a JSON array for the build matrix
           PKGS_JSON=$(jq -R -s -c 'split("\n") | map(select(length > 0))' to_build.txt)
           echo "to_build=$PKGS_JSON" >> "$GITHUB_OUTPUT"
 
