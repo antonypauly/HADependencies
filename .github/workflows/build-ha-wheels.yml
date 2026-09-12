@@ -73,10 +73,10 @@ jobs:
             -v "$PWD":/work -w /work \
             python:${{ needs.config.outputs.py_version }}-slim-bookworm \
             bash -c "
-              ls -l &&
               pip install --root-user-action=ignore --upgrade pip &&
               pip download --no-deps --dest /tmp/check \
-                --only-binary=:all: -r requirements_all.txt \
+                --only-binary=:all: \
+                -r requirements_all.txt \
                 > pip_download.log 2>&1 || true
             "
           cat pip_download.log || true
