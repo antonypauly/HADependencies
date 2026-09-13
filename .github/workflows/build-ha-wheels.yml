@@ -276,6 +276,16 @@ jobs:
                     || pip download --no-deps --dest /output --only-binary=:all: \
                       --platform manylinux_2_17_armv7l \"uv==\$VER\"
                     ;;
+                  av==17.0.1)
+                    # 17.0.1 predates PyAV's own fix for a Cython 3.x redeclaration bug
+                    # in leaf cclasses (upstream PR #2258, released in 17.1.0: "Add
+                    # cython.final to leaf classes"). Apply that patch to the 17.0.1
+                    # sdist directly rather than pinning an old Cython.
+                    pip download --no-deps --no-binary=:all: -d /tmp/avsrc "av==17.0.1" &&
+                    cd /tmp/avsrc && tar xzf av-17.0.1.tar.gz && cd av-17.0.1 &&
+                    curl -fsSL https://github.com/PyAV-Org/PyAV/pull/2258.diff | git apply --unidiff-zero -p1 --whitespace=fix &&
+                    pip wheel . -w /output --no-deps
+                    ;;
                   *)
                     pip wheel \"\$PKG\" -w /output --no-deps
                     ;;
