@@ -240,13 +240,9 @@ jobs:
           password: ${{ github.token }}
 
       - name: Build wheel for ${{ matrix.package }}
-        uses: nick-fields/retry@v3
         continue-on-error: true
-        with:
-          timeout_minutes: 15
-          max_attempts: 3
-          retry_wait_seconds: 15
-          command: |
+        timeout-minutes: 45
+        run: |
             mkdir -p output
             docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
               -v "$PWD/output":/output \

@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libavfilter-dev \
     libswscale-dev \
     libswresample-dev \
+    libsodium-dev \
+    libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --upgrade pip wheel
