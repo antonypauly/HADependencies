@@ -184,7 +184,8 @@ jobs:
         id: tag
         run: |
           HASH=$(sha256sum docker/build-env.Dockerfile | cut -c1-12)
-          IMAGE="ghcr.io/${{ github.repository }}/ha-wheels-build-env:${HASH}"
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${REPO_LOWER}/ha-wheels-build-env:${HASH}"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v3
