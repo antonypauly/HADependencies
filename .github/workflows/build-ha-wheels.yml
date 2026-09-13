@@ -84,13 +84,9 @@ jobs:
             | sed 's/^[^:]*://' | sort -u > combined_requirements.txt
 
       - name: Check PyPI metadata for a matching armv7/cp314 wheel (no downloads)
-        id: parse
+        id: metadata_check
+        if: github.event.inputs.test_package == ''
         run: |
-          if [ -n "${{ github.event.inputs.test_package }}" ]; then
-            echo "Test mode: building only ${{ github.event.inputs.test_package }}"
-            echo "to_build=[\"${{ github.event.inputs.test_package }}\"]" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           set +e   # individual grep/curl misses are expected here, not fatal
           : > to_build.txt
           : > needs_review.txt
@@ -113,10 +109,47 @@ jobs:
             fi
           done < combined_requirements.txt
           set -e
-          echo "Packages needing a build:"
+          echo "Packages needing a build (before skip-existing filter):"
           cat to_build.txt
           echo "Skipped/unresolved — check manually:"
           cat needs_review.txt
+
+      - name: Skip packages that already have a published wheel
+        id: parse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ github.event.inputs.test_package }}" ]; then
+            echo "Test mode: building only ${{ github.event.inputs.test_package }}"
+            echo "to_build=[\"${{ github.event.inputs.test_package }}\"]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          set +e
+          TAG="ha-wheels-${{ needs.config.outputs.ha_version }}"
+          # List filenames already attached to this release, if it exists.
+          # A brand-new tag (first run for this HA version) just yields
+          # nothing here, so everything in to_build.txt proceeds normally.
+          gh release view "$TAG" --json assets --jq '.assets[].name' \
+            > existing_assets.txt 2>/dev/null
+          set -e
+
+          : > to_build_filtered.txt
+          while IFS= read -r req; do
+            name=$(echo "$req" | grep -oE '^[A-Za-z0-9_.-]+' | tr 'A-Z' 'a-z' | tr '_.' '--')
+            version=$(echo "$req" | grep -oP '(?<===)[0-9][A-Za-z0-9_.\-]*' | head -1)
+            # Wheel filenames normalize the package name (- and _ and . all
+            # collapse together), so match loosely rather than exactly.
+            if grep -qi "${name}-${version}" existing_assets.txt 2>/dev/null; then
+              echo "Already built, skipping: $req"
+            else
+              echo "$req" >> to_build_filtered.txt
+            fi
+          done < to_build.txt
+          mv to_build_filtered.txt to_build.txt
+
+          echo "Packages needing a build (after skip-existing filter):"
+          cat to_build.txt
           PKGS_JSON=$(jq -R -s -c 'split("\n") | map(select(length > 0))' to_build.txt)
           echo "to_build=$PKGS_JSON" >> "$GITHUB_OUTPUT"
 
@@ -219,9 +252,87 @@ jobs:
       - name: List built wheels
         run: ls -la dist
 
+      - name: Set release tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.test_package }}" ]; then
+            echo "tag=ha-wheels-test" >> "$GITHUB_OUTPUT"
+            echo "title=HA armv7 wheels — TEST" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=ha-wheels-${{ needs.config.outputs.ha_version }}" >> "$GITHUB_OUTPUT"
+            echo "title=HA armv7 wheels — ${{ needs.config.outputs.ha_version }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ha-wheels-${{ needs.config.outputs.ha_version }}
-          name: HA armv7 wheels — ${{ needs.config.outputs.ha_version }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.title }}
           files: dist/*.whl
           fail_on_unmatched_files: false
+
+  # ---------------------------------------------------------------
+  # 5. Publish a real PEP 503 "simple" package index (like PyPI/piwheels)
+  #    via GitHub Pages, generated from the real release's assets.
+  #    Never runs for test_package runs, so test wheels can never leak
+  #    into the published index.
+  # ---------------------------------------------------------------
+  publish-index:
+    needs: [config, publish]
+    if: >
+      always() &&
+      needs.publish.result == 'success' &&
+      github.event.inputs.test_package == ''
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Generate PEP 503 simple index from release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ha-wheels-${{ needs.config.outputs.ha_version }}
+        run: |
+          gh release view "$TAG" --json assets --jq '.assets[].name' > filenames.txt
+          python3 <<'PYEOF'
+          import re, os
+
+          repo = os.environ["REPO"]
+          tag = os.environ["TAG"]
+
+          with open("filenames.txt") as f:
+              filenames = [l.strip() for l in f if l.strip().endswith(".whl")]
+
+          packages = {}
+          for fn in filenames:
+              raw_name = fn.split("-")[0]
+              norm = re.sub(r"[-_.]+", "-", raw_name).lower()
+              url = f"https://github.com/{repo}/releases/download/{tag}/{fn}"
+              packages.setdefault(norm, []).append((fn, url))
+
+          os.makedirs("site/simple", exist_ok=True)
+          with open("site/simple/index.html", "w") as f:
+              f.write("<!DOCTYPE html><html><body>\n")
+              for name in sorted(packages):
+                  f.write(f'<a href="{name}/">{name}</a><br>\n')
+              f.write("</body></html>\n")
+
+          for name, files in packages.items():
+              d = f"site/simple/{name}"
+              os.makedirs(d, exist_ok=True)
+              with open(f"{d}/index.html", "w") as f:
+                  f.write("<!DOCTYPE html><html><body>\n")
+                  for fn, url in files:
+                      f.write(f'<a href="{url}">{fn}</a><br>\n')
+                  f.write("</body></html>\n")
+          PYEOF
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - uses: actions/deploy-pages@v4
+        id: deployment
