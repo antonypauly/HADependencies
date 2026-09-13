@@ -273,16 +273,6 @@ jobs:
                     || pip download --no-deps --dest /output --only-binary=:all: \
                       --platform manylinux_2_17_armv7l \"uv==\$VER\"
                     ;;
-                  av==17.0.1)
-                    # This exact av release fails to Cythonize against
-                    # newer Cython (>=3.1) due to a strict redeclaration
-                    # check; fixed upstream in a later PyAV release via
-                    # @cython.final annotations. Scoped to this exact
-                    # version so the workaround stops applying once HA
-                    # bumps to a fixed av release.
-                    pip install 'cython<3.1' &&
-                    pip wheel \"\$PKG\" -w /output --no-deps --no-build-isolation
-                    ;;
                   *)
                     pip wheel \"\$PKG\" -w /output --no-deps
                     ;;
