@@ -1,4 +1,5 @@
-FROM python:3.14-trixie
+ARG PYTHON_VERSION=3.14
+FROM python:${PYTHON_VERSION}-trixie
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -16,4 +17,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade pip wheel
+RUN pip install --upgrade pip setuptools wheel

@@ -66,7 +66,7 @@ jobs:
             homeassistant/package_constraints.txt
 
   # ---------------------------------------------------------------
-  # 2. Detect which packages have NO existing armv7/cp314 wheel
+  # 2. Detect which packages have NO existing armv7/cp<version> wheel
   # ---------------------------------------------------------------
   detect:
     needs: config
@@ -83,11 +83,14 @@ jobs:
           grep -vE '^(#|-r |-c |\s*$)' requirements.txt requirements_all.txt \
             | sed 's/^[^:]*://' | sort -u > combined_requirements.txt
 
-      - name: Check PyPI metadata for a matching armv7/cp314 wheel (no downloads)
+      - name: Check PyPI metadata for a matching armv7 wheel (no downloads)
         id: metadata_check
         if: github.event.inputs.test_package == ''
+        env:
+          PY_VERSION: ${{ needs.config.outputs.py_version }}
         run: |
           set +e   # individual grep/curl misses are expected here, not fatal
+          CPTAG="cp$(echo "$PY_VERSION" | tr -d '.')"
           : > to_build.txt
           : > needs_review.txt
           while IFS= read -r req; do
@@ -103,7 +106,7 @@ jobs:
               continue
             fi
             match=$(echo "$json" | jq -r '.urls[].filename' 2>/dev/null \
-              | grep -E 'py[23]?(\.py3)?-none-any\.whl$|(armv7l).*cp314|cp314.*(armv7l)|armv7l.*cp3[0-9]+-abi3|cp3[0-9]+-abi3.*armv7l')
+              | grep -E "py[23]?(\.py3)?-none-any\.whl\$|(armv7l).*${CPTAG}|${CPTAG}.*(armv7l)|armv7l.*cp3[0-9]+-abi3|cp3[0-9]+-abi3.*armv7l")
             if [ -z "$match" ]; then
               echo "$name==$version" >> to_build.txt
             fi
@@ -136,10 +139,11 @@ jobs:
 
           : > to_build_filtered.txt
           while IFS= read -r req; do
-            name=$(echo "$req" | grep -oE '^[A-Za-z0-9_.-]+' | tr 'A-Z' 'a-z' | tr '_.' '--')
+            name=$(echo "$req" | grep -oE '^[A-Za-z0-9_.-]+' | tr 'A-Z' 'a-z' | sed -E 's/[-_.]+/_/g')
             version=$(echo "$req" | grep -oP '(?<===)[0-9][A-Za-z0-9_.\-]*' | head -1)
-            # Wheel filenames normalize the package name (- and _ and . all
-            # collapse together), so match loosely rather than exactly.
+            # Wheel filenames (PEP 427) replace runs of -_. in the package
+            # name with a single underscore, since hyphen is the filename's
+            # own field separator — normalize the same way before matching.
             if grep -qi "${name}-${version}" existing_assets.txt 2>/dev/null; then
               echo "Already built, skipping: $req"
             else
@@ -180,10 +184,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute image tag from Dockerfile hash
+      - name: Compute image tag from Dockerfile hash + Python version
         id: tag
         run: |
-          HASH=$(sha256sum docker/build-env.Dockerfile | cut -c1-12)
+          HASH=$(cat docker/build-env.Dockerfile <(echo "${{ needs.config.outputs.py_version }}") | sha256sum | cut -c1-12)
           REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${REPO_LOWER}/ha-wheels-build-env:${HASH}"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
@@ -215,6 +219,8 @@ jobs:
           platforms: ${{ env.TARGET_PLATFORM }}
           push: true
           tags: ${{ steps.tag.outputs.image }}
+          build-args: |
+            PYTHON_VERSION=${{ needs.config.outputs.py_version }}
 
   # ---------------------------------------------------------------
   # 4. Build a wheel for each package that needs one (matrix)
@@ -246,22 +252,24 @@ jobs:
             mkdir -p output
             docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
               -v "$PWD/output":/output \
+              -e PY_VERSION="${{ needs.config.outputs.py_version }}" \
               ${{ needs.build-image.outputs.image }} \
               bash -c "
                 PKG='${{ matrix.package }}' &&
+                CPTAG=\"cp\$(echo \\\"\$PY_VERSION\\\" | tr -d '.')\" &&
                 case \"\$PKG\" in
                   uv==*)
                     # uv is a Rust binary; there's no Rust toolchain here
                     # and no need for one — Astral already publishes an
                     # official armv7 (manylinux_2_17_armv7l) wheel. If it's
                     # showing up here, it's almost certainly missing only
-                    # the cp314-specific tag, not the platform build.
+                    # the target cp<version>-specific tag, not the platform build.
                     # Pull whatever real wheel exists directly instead of
                     # trying to compile from source.
                     VER=\"\${PKG#uv==}\" &&
                     pip download --no-deps --dest /output --only-binary=:all: \
                       --platform manylinux_2_17_armv7l --implementation cp \
-                      --python-version 3.14 --abi cp314 \"uv==\$VER\" \
+                      --python-version \"\$PY_VERSION\" --abi \"\$CPTAG\" \"uv==\$VER\" \
                     || pip download --no-deps --dest /output --only-binary=:all: \
                       --platform manylinux_2_17_armv7l \"uv==\$VER\"
                     ;;
@@ -285,6 +293,7 @@ jobs:
         with:
           name: wheel-${{ matrix.package }}
           path: output/*.whl
+          if-no-files-found: error
 
   # ---------------------------------------------------------------
   # 4. Collect all built wheels and publish as a GitHub Release
