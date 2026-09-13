@@ -130,7 +130,7 @@ jobs:
           # List filenames already attached to this release, if it exists.
           # A brand-new tag (first run for this HA version) just yields
           # nothing here, so everything in to_build.txt proceeds normally.
-          gh release view "$TAG" --json assets --jq '.assets[].name' \
+          gh release view "$TAG" --repo ${{ github.repository }} --json assets --jq '.assets[].name' \
             > existing_assets.txt 2>/dev/null
           set -e
 
@@ -349,7 +349,7 @@ jobs:
           REPO: ${{ github.repository }}
           TAG: ha-wheels-${{ needs.config.outputs.ha_version }}
         run: |
-          gh release view "$TAG" --json assets --jq '.assets[].name' > filenames.txt
+          gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' > filenames.txt
           python3 <<'PYEOF'
           import re, os
 
