@@ -9,6 +9,9 @@ on:
       homeassistant_version:
         description: 'HA version to build wheels for (overrides build-config.yaml if set)'
         required: false
+      test_package:
+        description: 'Optional: build only this single package==version (skips full detection)'
+        required: false
 
 env:
   TARGET_PLATFORM: linux/arm/v7
@@ -83,6 +86,11 @@ jobs:
       - name: Check PyPI metadata for a matching armv7/cp314 wheel (no downloads)
         id: parse
         run: |
+          if [ -n "${{ github.event.inputs.test_package }}" ]; then
+            echo "Test mode: building only ${{ github.event.inputs.test_package }}"
+            echo "to_build=[\"${{ github.event.inputs.test_package }}\"]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           set +e   # individual grep/curl misses are expected here, not fatal
           : > to_build.txt
           : > needs_review.txt
@@ -156,6 +164,21 @@ jobs:
                 pip install --upgrade pip wheel &&
                 PKG='${{ matrix.package }}' &&
                 case \"\$PKG\" in
+                  uv==*)
+                    # uv is a Rust binary; there's no Rust toolchain here
+                    # and no need for one — Astral already publishes an
+                    # official armv7 (manylinux_2_17_armv7l) wheel. If it's
+                    # showing up here, it's almost certainly missing only
+                    # the cp314-specific tag, not the platform build.
+                    # Pull whatever real wheel exists directly instead of
+                    # trying to compile from source.
+                    VER=\"\${PKG#uv==}\" &&
+                    pip download --no-deps --dest /output --only-binary=:all: \
+                      --platform manylinux_2_17_armv7l --implementation cp \
+                      --python-version 3.14 --abi cp314 \"uv==\$VER\" \
+                    || pip download --no-deps --dest /output --only-binary=:all: \
+                      --platform manylinux_2_17_armv7l \"uv==\$VER\"
+                    ;;
                   av==17.0.1)
                     # This exact av release fails to Cythonize against
                     # newer Cython (>=3.1) due to a strict redeclaration
@@ -184,6 +207,8 @@ jobs:
     needs: [config, build]
     if: always()
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
