@@ -287,7 +287,7 @@ jobs:
                     pip wheel . -w /output --no-deps
                     ;;
                   *)
-                    pip wheel \"\$PKG\" -w /output --no-deps
+                    pip wheel \"\$PKG\" -w /output
                     ;;
                 esac
               "
