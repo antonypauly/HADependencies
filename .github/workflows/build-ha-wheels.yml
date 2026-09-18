@@ -278,7 +278,7 @@ jobs:
                     ;;
                   av==17.0.1)
                     pip install "cython==3.2.4" setuptools wheel
-                    pip wheel \"\$PKG\" --no-binary av --no-build-isolation-w /output
+                    pip wheel \"\$PKG\" --no-binary av --no-build-isolation -w /output
                     ;;
                   *)
                     pip wheel \"\$PKG\" -w /output
