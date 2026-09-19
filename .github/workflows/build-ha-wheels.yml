@@ -255,12 +255,13 @@ jobs:
             mkdir -p output
             docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
               -v "$PWD/output":/output \
+              -e PKG="${{ matrix.package }}" \
               -e PY_VERSION="${{ needs.config.outputs.py_version }}" \
               ${{ needs.build-image.outputs.image }} \
-              bash -c "
-                PKG='${{ matrix.package }}' &&
-                CPTAG=\"cp\$(echo \\\"\$PY_VERSION\\\" | tr -d '.')\" &&
-                case \"\$PKG\" in
+              bash -s <<'BUILD_SCRIPT'
+                set -e
+                CPTAG="cp$(echo "$PY_VERSION" | tr -d '.')"
+                case "$PKG" in
                   uv==*)
                     # uv is a Rust binary; there's no Rust toolchain here
                     # and no need for one — Astral already publishes an
@@ -269,12 +270,12 @@ jobs:
                     # the target cp<version>-specific tag, not the platform build.
                     # Pull whatever real wheel exists directly instead of
                     # trying to compile from source.
-                    VER=\"\${PKG#uv==}\" &&
+                    VER="${PKG#uv==}" &&
                     pip download --no-deps --dest /output --only-binary=:all: \
                       --platform manylinux_2_17_armv7l --implementation cp \
-                      --python-version \"\$PY_VERSION\" --abi \"\$CPTAG\" \"uv==\$VER\" \
+                      --python-version "$PY_VERSION" --abi "$CPTAG" "uv==$VER" \
                     || pip download --no-deps --dest /output --only-binary=:all: \
-                      --platform manylinux_2_17_armv7l \"uv==\$VER\"
+                      --platform manylinux_2_17_armv7l "uv==$VER"
                     ;;
                   av==17.0.1)
                     echo "Building $PKG against PyAV FFmpeg 8.1.2 ARMv7"
@@ -316,10 +317,10 @@ jobs:
                       -w /output
                     ;;
                   *)
-                    pip wheel \"\$PKG\" -w /output
+                    pip wheel "$PKG" -w /output
                     ;;
                 esac
-              "
+              BUILD_SCRIPT
 
       - uses: actions/upload-artifact@v4
         with:
