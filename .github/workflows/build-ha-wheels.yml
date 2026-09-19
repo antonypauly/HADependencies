@@ -260,6 +260,7 @@ jobs:
               ${{ needs.build-image.outputs.image }} \
               bash -s <<'BUILD_SCRIPT'
                 set -e
+                echo "Starting wheel build for PKG=[$PKG], PY_VERSION=[$PY_VERSION]"
                 CPTAG="cp$(echo "$PY_VERSION" | tr -d '.')"
                 case "$PKG" in
                   uv==*)
@@ -317,6 +318,7 @@ jobs:
                       -w /output
                     ;;
                   *)
+                    echo "Using generic wheel build for PKG=[$PKG]"
                     pip wheel "$PKG" -w /output
                     ;;
                 esac
