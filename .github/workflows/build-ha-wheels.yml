@@ -272,48 +272,55 @@ jobs:
                   || pip download --no-deps --dest /output --only-binary=:all: \
                     --platform manylinux_2_17_armv7l \"uv==\$VER\"
                   ;;
-                av==17.0.1)
-                  echo \"Building \$PKG against PyAV FFmpeg 8.1.2 ARMv7\"
+                  av==17.0.1)
+                    echo \"Building \$PKG against PyAV FFmpeg 8.1.2 ARMv7\"
 
-                  FFMPEG_VERSION=\"8.1.2-1\"
-                  FFMPEG_URL=\"https://github.com/PyAV-Org/pyav-ffmpeg/releases/download/\${FFMPEG_VERSION}/ffmpeg-manylinux-armv7l.tar.gz\"
-                  FFMPEG_SHA256=\"f5d9930c0bf1090b3a4cfb43ad01a017db7de97f8efc323662e1cc9466e9b26e\"
+                    FFMPEG_VERSION=\"8.1.2-1\"
+                    FFMPEG_URL=\"https://github.com/PyAV-Org/pyav-ffmpeg/releases/download/\${FFMPEG_VERSION}/ffmpeg-manylinux-armv7l.tar.gz\"
+                    FFMPEG_SHA256=\"f5d9930c0bf1090b3a4cfb43ad01a017db7de97f8efc323662e1cc9466e9b26e\"
 
-                  FFMPEG_ROOT=\"/tmp/pyav-ffmpeg\"
-                  FFMPEG_ARCHIVE=\"/tmp/ffmpeg-armv7l.tar.gz\"
+                    FFMPEG_ROOT=\"/tmp/pyav-ffmpeg\"
+                    FFMPEG_ARCHIVE=\"/tmp/ffmpeg-armv7l.tar.gz\"
 
-                  rm -rf \"\$FFMPEG_ROOT\"
-                  mkdir -p \"\$FFMPEG_ROOT\"
+                    rm -rf \"\$FFMPEG_ROOT\"
+                    mkdir -p \"\$FFMPEG_ROOT\"
 
-                  curl -L --fail --retry 3 \
-                    \"\$FFMPEG_URL\" \
-                    -o \"\$FFMPEG_ARCHIVE\"
+                    curl -L --fail --retry 3 \
+                      \"\$FFMPEG_URL\" \
+                      -o \"\$FFMPEG_ARCHIVE\"
 
-                  echo \"\${FFMPEG_SHA256}  \${FFMPEG_ARCHIVE}\" | sha256sum -c -
+                    echo \"\${FFMPEG_SHA256}  \${FFMPEG_ARCHIVE}\" | sha256sum -c -
 
-                  tar -xzf \"\$FFMPEG_ARCHIVE\" -C \"\$FFMPEG_ROOT\"
+                    tar -xzf \"\$FFMPEG_ARCHIVE\" -C \"\$FFMPEG_ROOT\"
 
-                  if [ -d \"\$FFMPEG_ROOT/include\" ] && [ -d \"\$FFMPEG_ROOT/lib\" ]; then
-                    FFMPEG_DIR=\"\$FFMPEG_ROOT\"
-                  else
-                    FFMPEG_DIR=\"\$(find \"\$FFMPEG_ROOT\" -mindepth 1 -maxdepth 1 -type d | head -1)\"
-                  fi
+                    if [ -d \"\$FFMPEG_ROOT/include\" ] && [ -d \"\$FFMPEG_ROOT/lib\" ]; then
+                      FFMPEG_DIR=\"\$FFMPEG_ROOT\"
+                    else
+                      FFMPEG_DIR=\"\$(find \"\$FFMPEG_ROOT\" -mindepth 1 -maxdepth 1 -type d | head -1)\"
+                    fi
 
-                  echo \"Using FFmpeg directory: \$FFMPEG_DIR\"
+                    echo \"Using FFmpeg directory: \$FFMPEG_DIR\"
 
-                  test -d \"\$FFMPEG_DIR/include\"
-                  test -d \"\$FFMPEG_DIR/lib\"
+                    test -d \"\$FFMPEG_DIR/include\"
+                    test -d \"\$FFMPEG_DIR/lib\"
+                    test -d \"\$FFMPEG_DIR/lib/pkgconfig\"
 
-                  \"\$FFMPEG_DIR/bin/ffmpeg\" -version | head -1
+                    export PKG_CONFIG_PATH=\"\$FFMPEG_DIR/lib/pkgconfig\"
+                    export LD_LIBRARY_PATH=\"\$FFMPEG_DIR/lib:\${LD_LIBRARY_PATH:-}\"
 
-                  pip install \"cython==3.2.4\" setuptools wheel
+                    echo \"PKG_CONFIG_PATH=\$PKG_CONFIG_PATH\"
 
-                  pip wheel \"\$PKG\" \
-                    --no-binary av \
-                    --no-build-isolation \
-                    --config-settings=\"--build-option=--ffmpeg-dir=\$FFMPEG_DIR\" \
-                    -w /output
-                  ;;
+                    pkg-config --modversion libavformat
+                    pkg-config --modversion libavcodec
+                    pkg-config --modversion libavutil
+
+                    pip install \"cython==3.2.4\" setuptools wheel
+
+                    pip wheel \"\$PKG\" \
+                      --no-binary av \
+                      --no-build-isolation \
+                      -w /output
+                    ;;
                 *)
                   pip wheel \"\$PKG\" -w /output
                   ;;
