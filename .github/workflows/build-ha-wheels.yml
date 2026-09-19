@@ -322,7 +322,7 @@ jobs:
                     pip wheel "$PKG" -w /output
                     ;;
                 esac
-              BUILD_SCRIPT
+            BUILD_SCRIPT
 
       - uses: actions/upload-artifact@v4
         with:
