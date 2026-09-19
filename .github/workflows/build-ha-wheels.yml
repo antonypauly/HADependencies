@@ -252,77 +252,73 @@ jobs:
         continue-on-error: true
         timeout-minutes: 45
         run: |
-            mkdir -p output
-            docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
-              -v "$PWD/output":/output \
-              -e PKG="${{ matrix.package }}" \
-              -e PY_VERSION="${{ needs.config.outputs.py_version }}" \
-              ${{ needs.build-image.outputs.image }} \
-              bash -s <<'BUILD_SCRIPT'
-                set -e
-                echo "Starting wheel build for PKG=[$PKG], PY_VERSION=[$PY_VERSION]"
-                CPTAG="cp$(echo "$PY_VERSION" | tr -d '.')"
-                case "$PKG" in
-                  uv==*)
-                    # uv is a Rust binary; there's no Rust toolchain here
-                    # and no need for one — Astral already publishes an
-                    # official armv7 (manylinux_2_17_armv7l) wheel. If it's
-                    # showing up here, it's almost certainly missing only
-                    # the target cp<version>-specific tag, not the platform build.
-                    # Pull whatever real wheel exists directly instead of
-                    # trying to compile from source.
-                    VER="${PKG#uv==}" &&
-                    pip download --no-deps --dest /output --only-binary=:all: \
-                      --platform manylinux_2_17_armv7l --implementation cp \
-                      --python-version "$PY_VERSION" --abi "$CPTAG" "uv==$VER" \
-                    || pip download --no-deps --dest /output --only-binary=:all: \
-                      --platform manylinux_2_17_armv7l "uv==$VER"
-                    ;;
-                  av==17.0.1)
-                    echo "Building $PKG against PyAV FFmpeg 8.1.2 ARMv7"
-                    FFMPEG_VERSION="8.1.2-1"
-                    FFMPEG_URL="https://github.com/PyAV-Org/pyav-ffmpeg/releases/download/${FFMPEG_VERSION}/ffmpeg-manylinux-armv7l.tar.gz"
-                    FFMPEG_SHA256="f5d9930c0bf1090b3a4cfb43ad01a017db7de97f8efc323662e1cc9466e9b26e"
+          mkdir -p output
+          docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
+            -v "$PWD/output":/output \
+            -e PY_VERSION="${{ needs.config.outputs.py_version }}" \
+            ${{ needs.build-image.outputs.image }} \
+            bash -c "
+              PKG='${{ matrix.package }}' &&
+              CPTAG=\"cp\$(echo \\\"\$PY_VERSION\\\" | tr -d '.')\" &&
+              case \"\$PKG\" in
+                uv==*)
+                  # uv is a Rust binary; there's no Rust toolchain here
+                  # and no need for one — Astral already publishes an
+                  # official armv7 (manylinux_2_17_armv7l) wheel.
+                  VER=\"\${PKG#uv==}\" &&
+                  pip download --no-deps --dest /output --only-binary=:all: \
+                    --platform manylinux_2_17_armv7l --implementation cp \
+                    --python-version \"\$PY_VERSION\" --abi \"\$CPTAG\" \"uv==\$VER\" \
+                  || pip download --no-deps --dest /output --only-binary=:all: \
+                    --platform manylinux_2_17_armv7l \"uv==\$VER\"
+                  ;;
+                av==17.0.1)
+                  echo \"Building \$PKG against PyAV FFmpeg 8.1.2 ARMv7\"
 
-                    FFMPEG_ROOT="/tmp/pyav-ffmpeg"
-                    FFMPEG_ARCHIVE="/tmp/ffmpeg-armv7l.tar.gz"
+                  FFMPEG_VERSION=\"8.1.2-1\"
+                  FFMPEG_URL=\"https://github.com/PyAV-Org/pyav-ffmpeg/releases/download/\${FFMPEG_VERSION}/ffmpeg-manylinux-armv7l.tar.gz\"
+                  FFMPEG_SHA256=\"f5d9930c0bf1090b3a4cfb43ad01a017db7de97f8efc323662e1cc9466e9b26e\"
 
-                    rm -rf "$FFMPEG_ROOT"
-                    mkdir -p "$FFMPEG_ROOT"
+                  FFMPEG_ROOT=\"/tmp/pyav-ffmpeg\"
+                  FFMPEG_ARCHIVE=\"/tmp/ffmpeg-armv7l.tar.gz\"
 
-                    curl -L --fail --retry 3 \
-                      "$FFMPEG_URL" \
-                      -o "$FFMPEG_ARCHIVE"
+                  rm -rf \"\$FFMPEG_ROOT\"
+                  mkdir -p \"\$FFMPEG_ROOT\"
 
-                    echo "${FFMPEG_SHA256}  ${FFMPEG_ARCHIVE}" | sha256sum -c -
+                  curl -L --fail --retry 3 \
+                    \"\$FFMPEG_URL\" \
+                    -o \"\$FFMPEG_ARCHIVE\"
 
-                    tar -xzf "$FFMPEG_ARCHIVE" -C "$FFMPEG_ROOT"
+                  echo \"\${FFMPEG_SHA256}  \${FFMPEG_ARCHIVE}\" | sha256sum -c -
 
-                    if [ -d "$FFMPEG_ROOT/include" ] && [ -d "$FFMPEG_ROOT/lib" ]; then
-                        FFMPEG_DIR="$FFMPEG_ROOT"
-                    else
-                        FFMPEG_DIR="$(find "$FFMPEG_ROOT" -mindepth 1 -maxdepth 1 -type d | head -1)"
-                    fi
+                  tar -xzf \"\$FFMPEG_ARCHIVE\" -C \"\$FFMPEG_ROOT\"
 
-                    echo "Using FFmpeg directory: $FFMPEG_DIR"
+                  if [ -d \"\$FFMPEG_ROOT/include\" ] && [ -d \"\$FFMPEG_ROOT/lib\" ]; then
+                    FFMPEG_DIR=\"\$FFMPEG_ROOT\"
+                  else
+                    FFMPEG_DIR=\"\$(find \"\$FFMPEG_ROOT\" -mindepth 1 -maxdepth 1 -type d | head -1)\"
+                  fi
 
-                    test -d "$FFMPEG_DIR/include"
-                    test -d "$FFMPEG_DIR/lib"
+                  echo \"Using FFmpeg directory: \$FFMPEG_DIR\"
 
-                    "$FFMPEG_DIR/bin/ffmpeg" -version | head -1
-                    pip install "cython==3.2.4" setuptools wheel
-                    pip wheel "$PKG" \
-                      --no-binary av \
-                      --no-build-isolation \
-                      --config-settings="--build-option=--ffmpeg-dir=$FFMPEG_DIR" \
-                      -w /output
-                    ;;
-                  *)
-                    echo "Using generic wheel build for PKG=[$PKG]"
-                    pip wheel "$PKG" -w /output
-                    ;;
-                esac
-            BUILD_SCRIPT
+                  test -d \"\$FFMPEG_DIR/include\"
+                  test -d \"\$FFMPEG_DIR/lib\"
+
+                  \"\$FFMPEG_DIR/bin/ffmpeg\" -version | head -1
+
+                  pip install \"cython==3.2.4\" setuptools wheel
+
+                  pip wheel \"\$PKG\" \
+                    --no-binary av \
+                    --no-build-isolation \
+                    --config-settings=\"--build-option=--ffmpeg-dir=\$FFMPEG_DIR\" \
+                    -w /output
+                  ;;
+                *)
+                  pip wheel \"\$PKG\" -w /output
+                  ;;
+              esac
+            "
 
       - uses: actions/upload-artifact@v4
         with:
