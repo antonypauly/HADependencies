@@ -1,0 +1,42 @@
+name: Rebuild wheel index
+
+# Regenerates the PEP 503 index from the wheels in ALL ha-wheels-* releases and
+# deploys it to GitHub Pages. No building, no publishing of wheels.
+on:
+  workflow_dispatch:
+
+# Same group as the main workflow so the two never deploy at the same time.
+concurrency:
+  group: build-ha-wheels
+  cancel-in-progress: false
+
+jobs:
+  publish-index:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate PEP 503 simple index from all releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/list_wheels.sh "$GITHUB_REPOSITORY" all_wheels.tsv
+          if [ ! -s all_wheels.tsv ]; then
+            echo "No wheels found in any ha-wheels-* release; refusing to deploy an empty index"
+            exit 1
+          fi
+          python3 scripts/make_index.py all_wheels.tsv site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - uses: actions/deploy-pages@v4
+        id: deployment
