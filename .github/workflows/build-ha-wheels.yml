@@ -96,29 +96,8 @@ jobs:
           env:
             PY_VERSION: ${{ needs.config.outputs.py_version }}
           run: |
-            set +e   # individual grep/curl misses are expected here, not fatal
-            CPTAG="cp$(echo "$PY_VERSION" | tr -d '.')"
-            : > to_build.txt
-            : > needs_review.txt
-            while IFS= read -r req; do
-              name=$(echo "$req" | grep -oE '^[A-Za-z0-9_.-]+')
-              version=$(echo "$req" | grep -oP '(?<===)[0-9][A-Za-z0-9_.\-]*' | head -1)
-              if [ -z "$name" ] || [ -z "$version" ]; then
-                echo "$req" >> needs_review.txt
-                continue
-              fi
-              json=$(curl -fsSL "https://pypi.org/pypi/${name}/${version}/json" 2>/dev/null)
-              if [ -z "$json" ]; then
-                echo "$name==$version" >> needs_review.txt
-                continue
-              fi
-              match=$(echo "$json" | jq -r '.urls[].filename' 2>/dev/null \
-                | grep -E "py[23]?(\.py3)?-none-any\.whl\$|(armv7l).*${CPTAG}|${CPTAG}.*(armv7l)|armv7l.*cp3[0-9]+-abi3|cp3[0-9]+-abi3.*armv7l")
-              if [ -z "$match" ]; then
-                echo "$name==$version" >> to_build.txt
-              fi
-            done < combined_requirements.txt
-            set -e
+            pip install --quiet packaging
+            python3 scripts/resolve_requirements.py "$PY_VERSION" combined_requirements.txt to_build.txt needs_review.txt
             echo "Packages needing a build (before skip-existing filter):"
             cat to_build.txt
             echo "Skipped/unresolved — check manually:"
