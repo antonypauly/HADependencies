@@ -93,6 +93,7 @@ jobs:
         if: github.event.inputs.test_package == ''
         env:
           PY_VERSION: ${{ needs.config.outputs.py_version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           CPTAG="cp$(echo "${{ needs.config.outputs.py_version }}" | tr -d '.')"
           pip install --quiet packaging
