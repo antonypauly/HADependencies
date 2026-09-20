@@ -73,48 +73,87 @@ jobs:
   # 2. Detect which packages have NO existing armv7/cp<version> wheel
   # ---------------------------------------------------------------
   detect:
-    needs: config
-    runs-on: ubuntu-latest
-    outputs:
-      to_build: ${{ steps.parse.outputs.to_build }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: requirements
+      needs: config
+      runs-on: ubuntu-latest
+      outputs:
+        to_build: ${{ steps.parse.outputs.to_build }}
+      steps:
+        - uses: actions/checkout@v4
 
-      - name: Build combined package list
-        run: |
-          grep -vE '^(#|-r |-c |\s*$)' requirements.txt requirements_all.txt \
-            | sed 's/^[^:]*://' | sort -u > combined_requirements.txt
+        - uses: actions/download-artifact@v4
+          with:
+            name: requirements
 
-      - name: Check PyPI metadata for a matching armv7 wheel (no downloads)
-        id: metadata_check
-        if: github.event.inputs.test_package == ''
-        env:
-          PY_VERSION: ${{ needs.config.outputs.py_version }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          CPTAG="cp$(echo "${{ needs.config.outputs.py_version }}" | tr -d '.')"
-          pip install --quiet packaging
-          bash scripts/list_wheels.sh "$GITHUB_REPOSITORY" all_wheels.tsv
-          python3 scripts/filter_built.py "$CPTAG" all_wheels.tsv to_build.txt > to_build_filtered.txt
-          mv to_build_filtered.txt to_build.txt
+        - name: Build combined package list
+          run: |
+            grep -vE '^(#|-r |-c |\s*$)' requirements.txt requirements_all.txt \
+              | sed 's/^[^:]*://' | sort -u > combined_requirements.txt
 
-          echo "Packages needing a build (after skip-existing filter):"
-          cat to_build.txt
-          PKGS_JSON=$(jq -R -s -c 'split("\n") | map(select(length > 0))' to_build.txt)
-          echo "to_build=$PKGS_JSON" >> "$GITHUB_OUTPUT"
+        - name: Check PyPI metadata for a matching armv7 wheel (no downloads)
+          id: metadata_check
+          if: github.event.inputs.test_package == ''
+          env:
+            PY_VERSION: ${{ needs.config.outputs.py_version }}
+          run: |
+            set +e   # individual grep/curl misses are expected here, not fatal
+            CPTAG="cp$(echo "$PY_VERSION" | tr -d '.')"
+            : > to_build.txt
+            : > needs_review.txt
+            while IFS= read -r req; do
+              name=$(echo "$req" | grep -oE '^[A-Za-z0-9_.-]+')
+              version=$(echo "$req" | grep -oP '(?<===)[0-9][A-Za-z0-9_.\-]*' | head -1)
+              if [ -z "$name" ] || [ -z "$version" ]; then
+                echo "$req" >> needs_review.txt
+                continue
+              fi
+              json=$(curl -fsSL "https://pypi.org/pypi/${name}/${version}/json" 2>/dev/null)
+              if [ -z "$json" ]; then
+                echo "$name==$version" >> needs_review.txt
+                continue
+              fi
+              match=$(echo "$json" | jq -r '.urls[].filename' 2>/dev/null \
+                | grep -E "py[23]?(\.py3)?-none-any\.whl\$|(armv7l).*${CPTAG}|${CPTAG}.*(armv7l)|armv7l.*cp3[0-9]+-abi3|cp3[0-9]+-abi3.*armv7l")
+              if [ -z "$match" ]; then
+                echo "$name==$version" >> to_build.txt
+              fi
+            done < combined_requirements.txt
+            set -e
+            echo "Packages needing a build (before skip-existing filter):"
+            cat to_build.txt
+            echo "Skipped/unresolved — check manually:"
+            cat needs_review.txt
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: needs-review-list
-          path: needs_review.txt
+        - name: Skip packages that already have a published wheel
+          id: parse
+          env:
+            GH_TOKEN: ${{ github.token }}
+          run: |
+            if [ -n "${{ github.event.inputs.test_package }}" ]; then
+              echo "Test mode: building only ${{ github.event.inputs.test_package }}"
+              echo "to_build=[\"${{ github.event.inputs.test_package }}\"]" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: to-build-list
-          path: to_build.txt
+            CPTAG="cp$(echo "${{ needs.config.outputs.py_version }}" | tr -d '.')"
+            pip install --quiet packaging
+            bash scripts/list_wheels.sh "$GITHUB_REPOSITORY" all_wheels.tsv
+            python3 scripts/filter_built.py "$CPTAG" all_wheels.tsv to_build.txt > to_build_filtered.txt
+            mv to_build_filtered.txt to_build.txt
+
+            echo "Packages needing a build (after skip-existing filter):"
+            cat to_build.txt
+            PKGS_JSON=$(jq -R -s -c 'split("\n") | map(select(length > 0))' to_build.txt)
+            echo "to_build=$PKGS_JSON" >> "$GITHUB_OUTPUT"
+
+        - uses: actions/upload-artifact@v4
+          with:
+            name: needs-review-list
+            path: needs_review.txt
+
+        - uses: actions/upload-artifact@v4
+          with:
+            name: to-build-list
+            path: to_build.txt
 
   # ---------------------------------------------------------------
   # 3. Build (or reuse) a shared armv7 build environment image, once,
