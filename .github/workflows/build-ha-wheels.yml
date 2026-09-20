@@ -33,22 +33,59 @@ jobs:
       py_version: ${{ steps.set.outputs.py_version }}
     steps:
       - uses: actions/checkout@v4
-
+ 
       - name: Install yq
         run: sudo snap install yq
-
+ 
       - name: Resolve target versions
         id: set
+        env:
+          INPUT_HA_VERSION: ${{ github.event.inputs.homeassistant_version }}
         run: |
-          if [ -n "${{ github.event.inputs.homeassistant_version }}" ]; then
-            HA_VERSION="${{ github.event.inputs.homeassistant_version }}"
+          set -euo pipefail
+ 
+          if [ -n "$INPUT_HA_VERSION" ]; then
+            HA_VERSION="$INPUT_HA_VERSION"
           else
             HA_VERSION=$(yq '.homeassistant_version' build-config.yaml)
           fi
-          PY_VERSION=$(yq '.python_version' build-config.yaml)
+ 
+          # Minimum Python minor version this HA release requires
+          curl -fsSL --retry 3 \
+            "https://raw.githubusercontent.com/home-assistant/core/${HA_VERSION}/pyproject.toml" \
+            -o ha-pyproject.toml
+ 
+          MIN_PY=$(python3 - <<'PY'
+          import re, sys, tomllib
+ 
+          with open("ha-pyproject.toml", "rb") as f:
+              spec = tomllib.load(f)["project"]["requires-python"]   # e.g. ">=3.13.2"
+ 
+          m = re.search(r">=\s*(\d+)\.(\d+)", spec)
+          if not m:
+              sys.exit(f"Could not parse requires-python: {spec!r}")
+          print(f"{m.group(1)}.{m.group(2)}")
+          PY
+          )
+ 
+          # Optional override: python_version in build-config.yaml
+          # (use it when the Python on the Pi is newer than HA's minimum)
+          PY_OVERRIDE=$(yq '.python_version // ""' build-config.yaml)
+          PY_VERSION="${PY_OVERRIDE:-$MIN_PY}"
+          # The cp-tag logic in detect/build (tr -d '.') assumes major.minor
+          PY_VERSION=$(echo "$PY_VERSION" | cut -d. -f1,2)
+ 
+          echo "HA ${HA_VERSION} requires Python >= ${MIN_PY}; building for ${PY_VERSION}"
+ 
+          # An override must not be lower than HA's minimum
+          if [ "$(printf '%s\n%s\n' "$MIN_PY" "$PY_VERSION" | sort -V | head -1)" != "$MIN_PY" ]; then
+            echo "::error::python_version ${PY_VERSION} is below HA ${HA_VERSION}'s minimum ${MIN_PY}"
+            exit 1
+          fi
+ 
           echo "ha_version=$HA_VERSION" >> "$GITHUB_OUTPUT"
           echo "py_version=$PY_VERSION" >> "$GITHUB_OUTPUT"
-
+ 
       - name: Fetch requirements files for this HA version
         run: |
           # requirements_all.txt references both requirements.txt (-r) and
@@ -61,7 +98,7 @@ jobs:
           mkdir -p homeassistant
           curl -fsSL -o homeassistant/package_constraints.txt \
             "https://raw.githubusercontent.com/home-assistant/core/${{ steps.set.outputs.ha_version }}/homeassistant/package_constraints.txt"
-
+ 
       - uses: actions/upload-artifact@v4
         with:
           name: requirements
@@ -69,6 +106,7 @@ jobs:
             requirements.txt
             requirements_all.txt
             homeassistant/package_constraints.txt
+
 
   # ---------------------------------------------------------------
   # 2. Detect which packages have NO existing armv7/cp<version> wheel
