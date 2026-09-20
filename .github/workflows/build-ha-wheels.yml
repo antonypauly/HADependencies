@@ -13,6 +13,10 @@ on:
         description: 'Optional: build only this single package==version (skips full detection)'
         required: false
 
+concurrency:
+  group: build-ha-wheels
+  cancel-in-progress: false
+
 env:
   TARGET_PLATFORM: linux/arm/v7
   WHEEL_PLATFORM_TAG: linux_armv7l   # glibc tag, matches DietPi (Debian-based)
@@ -69,106 +73,87 @@ jobs:
   # 2. Detect which packages have NO existing armv7/cp<version> wheel
   # ---------------------------------------------------------------
   detect:
-    needs: config
-    runs-on: ubuntu-latest
-    outputs:
-      to_build: ${{ steps.parse.outputs.to_build }}
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: requirements
+      needs: config
+      runs-on: ubuntu-latest
+      outputs:
+        to_build: ${{ steps.parse.outputs.to_build }}
+      steps:
+        - uses: actions/checkout@v4
 
-      - name: Build combined package list
-        run: |
-          grep -vE '^(#|-r |-c |\s*$)' requirements.txt requirements_all.txt \
-            | sed 's/^[^:]*://' | sort -u > combined_requirements.txt
+        - uses: actions/download-artifact@v4
+          with:
+            name: requirements
 
-      - name: Check PyPI metadata for a matching armv7 wheel (no downloads)
-        id: metadata_check
-        if: github.event.inputs.test_package == ''
-        env:
-          PY_VERSION: ${{ needs.config.outputs.py_version }}
-        run: |
-          set +e   # individual grep/curl misses are expected here, not fatal
-          CPTAG="cp$(echo "$PY_VERSION" | tr -d '.')"
-          : > to_build.txt
-          : > needs_review.txt
-          while IFS= read -r req; do
-            name=$(echo "$req" | grep -oE '^[A-Za-z0-9_.-]+')
-            version=$(echo "$req" | grep -oP '(?<===)[0-9][A-Za-z0-9_.\-]*' | head -1)
-            if [ -z "$name" ] || [ -z "$version" ]; then
-              echo "$req" >> needs_review.txt
-              continue
+        - name: Build combined package list
+          run: |
+            grep -vE '^(#|-r |-c |\s*$)' requirements.txt requirements_all.txt \
+              | sed 's/^[^:]*://' | sort -u > combined_requirements.txt
+
+        - name: Check PyPI metadata for a matching armv7 wheel (no downloads)
+          id: metadata_check
+          if: github.event.inputs.test_package == ''
+          env:
+            PY_VERSION: ${{ needs.config.outputs.py_version }}
+          run: |
+            set +e   # individual grep/curl misses are expected here, not fatal
+            CPTAG="cp$(echo "$PY_VERSION" | tr -d '.')"
+            : > to_build.txt
+            : > needs_review.txt
+            while IFS= read -r req; do
+              name=$(echo "$req" | grep -oE '^[A-Za-z0-9_.-]+')
+              version=$(echo "$req" | grep -oP '(?<===)[0-9][A-Za-z0-9_.\-]*' | head -1)
+              if [ -z "$name" ] || [ -z "$version" ]; then
+                echo "$req" >> needs_review.txt
+                continue
+              fi
+              json=$(curl -fsSL "https://pypi.org/pypi/${name}/${version}/json" 2>/dev/null)
+              if [ -z "$json" ]; then
+                echo "$name==$version" >> needs_review.txt
+                continue
+              fi
+              match=$(echo "$json" | jq -r '.urls[].filename' 2>/dev/null \
+                | grep -E "py[23]?(\.py3)?-none-any\.whl\$|(armv7l).*${CPTAG}|${CPTAG}.*(armv7l)|armv7l.*cp3[0-9]+-abi3|cp3[0-9]+-abi3.*armv7l")
+              if [ -z "$match" ]; then
+                echo "$name==$version" >> to_build.txt
+              fi
+            done < combined_requirements.txt
+            set -e
+            echo "Packages needing a build (before skip-existing filter):"
+            cat to_build.txt
+            echo "Skipped/unresolved — check manually:"
+            cat needs_review.txt
+
+        - name: Skip packages that already have a published wheel
+          id: parse
+          env:
+            GH_TOKEN: ${{ github.token }}
+          run: |
+            if [ -n "${{ github.event.inputs.test_package }}" ]; then
+              echo "Test mode: building only ${{ github.event.inputs.test_package }}"
+              echo "to_build=[\"${{ github.event.inputs.test_package }}\"]" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
-            json=$(curl -fsSL "https://pypi.org/pypi/${name}/${version}/json" 2>/dev/null)
-            if [ -z "$json" ]; then
-              echo "$name==$version" >> needs_review.txt
-              continue
-            fi
-            match=$(echo "$json" | jq -r '.urls[].filename' 2>/dev/null \
-              | grep -E "py[23]?(\.py3)?-none-any\.whl\$|(armv7l).*${CPTAG}|${CPTAG}.*(armv7l)|armv7l.*cp3[0-9]+-abi3|cp3[0-9]+-abi3.*armv7l")
-            if [ -z "$match" ]; then
-              echo "$name==$version" >> to_build.txt
-            fi
-          done < combined_requirements.txt
-          set -e
-          echo "Packages needing a build (before skip-existing filter):"
-          cat to_build.txt
-          echo "Skipped/unresolved — check manually:"
-          cat needs_review.txt
 
-      - name: Skip packages that already have a published wheel
-        id: parse
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if [ -n "${{ github.event.inputs.test_package }}" ]; then
-            echo "Test mode: building only ${{ github.event.inputs.test_package }}"
-            echo "to_build=[\"${{ github.event.inputs.test_package }}\"]" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+            CPTAG="cp$(echo "${{ needs.config.outputs.py_version }}" | tr -d '.')"
+            pip install --quiet packaging
+            bash scripts/list_wheels.sh "$GITHUB_REPOSITORY" all_wheels.tsv
+            python3 scripts/filter_built.py "$CPTAG" all_wheels.tsv to_build.txt > to_build_filtered.txt
+            mv to_build_filtered.txt to_build.txt
 
-          set +e
-          TAG="ha-wheels-${{ needs.config.outputs.ha_version }}"
-          # List filenames already attached to this release, if it exists.
-          # A brand-new tag (first run for this HA version) just yields
-          # nothing here, so everything in to_build.txt proceeds normally.
-          gh release view "$TAG" --repo ${{ github.repository }} --json assets --jq '.assets[].name' \
-            > existing_assets.txt 2>/dev/null
-          set -e
+            echo "Packages needing a build (after skip-existing filter):"
+            cat to_build.txt
+            PKGS_JSON=$(jq -R -s -c 'split("\n") | map(select(length > 0))' to_build.txt)
+            echo "to_build=$PKGS_JSON" >> "$GITHUB_OUTPUT"
 
-          : > to_build_filtered.txt
-          while IFS= read -r req; do
-            name=$(echo "$req" | grep -oE '^[A-Za-z0-9_.-]+' | tr 'A-Z' 'a-z' | sed -E 's/[-_.]+/_/g')
-            version=$(echo "$req" | grep -oP '(?<===)[0-9][A-Za-z0-9_.\-]*' | head -1)
-            # Wheel filenames (PEP 427) replace runs of -_. in the package
-            # name with a single underscore, since hyphen is the filename's
-            # own field separator — normalize the same way before matching.
-            # Also normalize the version per PEP 440 (e.g. 0.0.5-alpha -> 0.0.5a0),
-            # since that's the form that actually appears in built wheel filenames.
-            norm_version=$(python3 -c "from packaging.utils import canonicalize_version; print(canonicalize_version('$version'))" 2>/dev/null || echo "$version")
-            if grep -qi "${name}-${norm_version}" existing_assets.txt 2>/dev/null; then
-              echo "Already built, skipping: $req"
-            else
-              echo "$req" >> to_build_filtered.txt
-            fi
-          done < to_build.txt
-          mv to_build_filtered.txt to_build.txt
+        - uses: actions/upload-artifact@v4
+          with:
+            name: needs-review-list
+            path: needs_review.txt
 
-          echo "Packages needing a build (after skip-existing filter):"
-          cat to_build.txt
-          PKGS_JSON=$(jq -R -s -c 'split("\n") | map(select(length > 0))' to_build.txt)
-          echo "to_build=$PKGS_JSON" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: needs-review-list
-          path: needs_review.txt
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: to-build-list
-          path: to_build.txt
+        - uses: actions/upload-artifact@v4
+          with:
+            name: to-build-list
+            path: to_build.txt
 
   # ---------------------------------------------------------------
   # 3. Build (or reuse) a shared armv7 build environment image, once,
@@ -391,49 +376,18 @@ jobs:
     permissions:
       pages: write
       id-token: write
+      contents: read
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Generate PEP 503 simple index from release assets
+      - uses: actions/checkout@v4
+      - name: Generate PEP 503 simple index from all releases
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          TAG: ha-wheels-${{ needs.config.outputs.ha_version }}
         run: |
-          gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' > filenames.txt
-          python3 <<'PYEOF'
-          import re, os
-
-          repo = os.environ["REPO"]
-          tag = os.environ["TAG"]
-
-          with open("filenames.txt") as f:
-              filenames = [l.strip() for l in f if l.strip().endswith(".whl")]
-
-          packages = {}
-          for fn in filenames:
-              raw_name = fn.split("-")[0]
-              norm = re.sub(r"[-_.]+", "-", raw_name).lower()
-              url = f"https://github.com/{repo}/releases/download/{tag}/{fn}"
-              packages.setdefault(norm, []).append((fn, url))
-
-          os.makedirs("site/simple", exist_ok=True)
-          with open("site/simple/index.html", "w") as f:
-              f.write("<!DOCTYPE html><html><body>\n")
-              for name in sorted(packages):
-                  f.write(f'<a href="{name}/">{name}</a><br>\n')
-              f.write("</body></html>\n")
-
-          for name, files in packages.items():
-              d = f"site/simple/{name}"
-              os.makedirs(d, exist_ok=True)
-              with open(f"{d}/index.html", "w") as f:
-                  f.write("<!DOCTYPE html><html><body>\n")
-                  for fn, url in files:
-                      f.write(f'<a href="{url}">{fn}</a><br>\n')
-                  f.write("</body></html>\n")
-          PYEOF
+          bash scripts/list_wheels.sh "$GITHUB_REPOSITORY" all_wheels.tsv
+          python3 scripts/make_index.py all_wheels.tsv site
 
       - uses: actions/upload-pages-artifact@v3
         with:
