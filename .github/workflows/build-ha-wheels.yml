@@ -9,6 +9,9 @@ on:
       homeassistant_version:
         description: 'HA version to build wheels for (overrides build-config.yaml if set)'
         required: false
+      test_package:
+        description: 'Optional: build only this single package==version (skips full detection)'
+        required: false
 
 env:
   TARGET_PLATFORM: linux/arm/v7
@@ -41,19 +44,29 @@ jobs:
           echo "ha_version=$HA_VERSION" >> "$GITHUB_OUTPUT"
           echo "py_version=$PY_VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Fetch requirements_all.txt for this HA version
+      - name: Fetch requirements files for this HA version
         run: |
+          # requirements_all.txt references both requirements.txt (-r) and
+          # homeassistant/package_constraints.txt (-c) by relative path,
+          # matching HA's actual repo layout, so we recreate that structure.
+          curl -fsSL -o requirements.txt \
+            "https://raw.githubusercontent.com/home-assistant/core/${{ steps.set.outputs.ha_version }}/requirements.txt"
           curl -fsSL -o requirements_all.txt \
             "https://raw.githubusercontent.com/home-assistant/core/${{ steps.set.outputs.ha_version }}/requirements_all.txt"
+          mkdir -p homeassistant
+          curl -fsSL -o homeassistant/package_constraints.txt \
+            "https://raw.githubusercontent.com/home-assistant/core/${{ steps.set.outputs.ha_version }}/homeassistant/package_constraints.txt"
 
       - uses: actions/upload-artifact@v4
         with:
           name: requirements
-          path: requirements_all.txt
-          archive: false
+          path: |
+            requirements.txt
+            requirements_all.txt
+            homeassistant/package_constraints.txt
 
   # ---------------------------------------------------------------
-  # 2. Detect which packages have NO existing armv7/cp314 wheel
+  # 2. Detect which packages have NO existing armv7/cp<version> wheel
   # ---------------------------------------------------------------
   detect:
     needs: config
@@ -65,33 +78,92 @@ jobs:
         with:
           name: requirements
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Run pip download --only-binary check inside armv7 container
+      - name: Build combined package list
         run: |
-          docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
-            -v "$PWD":/work -w /work \
-            python:${{ needs.config.outputs.py_version }}-slim-bookworm \
-            bash -c "
-              pip install --root-user-action=ignore --upgrade pip &&
-              pip download --no-deps --dest /tmp/check \
-                --only-binary=:all: \
-                -r requirements_all.txt \
-                > pip_download.log 2>&1 || true
-            "
-          cat pip_download.log || true
+          grep -vE '^(#|-r |-c |\s*$)' requirements.txt requirements_all.txt \
+            | sed 's/^[^:]*://' | sort -u > combined_requirements.txt
 
-      - name: Parse failures into a package list
-        id: parse
+      - name: Check PyPI metadata for a matching armv7 wheel (no downloads)
+        id: metadata_check
+        if: github.event.inputs.test_package == ''
+        env:
+          PY_VERSION: ${{ needs.config.outputs.py_version }}
         run: |
-          grep -oP "No matching distribution found for \K[^\s]+" pip_download.log \
-            | sed 's/[<>=!~].*//' | sort -u > to_build.txt || true
-          echo "Packages needing a build:"
+          set +e   # individual grep/curl misses are expected here, not fatal
+          CPTAG="cp$(echo "$PY_VERSION" | tr -d '.')"
+          : > to_build.txt
+          : > needs_review.txt
+          while IFS= read -r req; do
+            name=$(echo "$req" | grep -oE '^[A-Za-z0-9_.-]+')
+            version=$(echo "$req" | grep -oP '(?<===)[0-9][A-Za-z0-9_.\-]*' | head -1)
+            if [ -z "$name" ] || [ -z "$version" ]; then
+              echo "$req" >> needs_review.txt
+              continue
+            fi
+            json=$(curl -fsSL "https://pypi.org/pypi/${name}/${version}/json" 2>/dev/null)
+            if [ -z "$json" ]; then
+              echo "$name==$version" >> needs_review.txt
+              continue
+            fi
+            match=$(echo "$json" | jq -r '.urls[].filename' 2>/dev/null \
+              | grep -E "py[23]?(\.py3)?-none-any\.whl\$|(armv7l).*${CPTAG}|${CPTAG}.*(armv7l)|armv7l.*cp3[0-9]+-abi3|cp3[0-9]+-abi3.*armv7l")
+            if [ -z "$match" ]; then
+              echo "$name==$version" >> to_build.txt
+            fi
+          done < combined_requirements.txt
+          set -e
+          echo "Packages needing a build (before skip-existing filter):"
           cat to_build.txt
-          # Turn into a JSON array for the build matrix
+          echo "Skipped/unresolved — check manually:"
+          cat needs_review.txt
+
+      - name: Skip packages that already have a published wheel
+        id: parse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ github.event.inputs.test_package }}" ]; then
+            echo "Test mode: building only ${{ github.event.inputs.test_package }}"
+            echo "to_build=[\"${{ github.event.inputs.test_package }}\"]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          set +e
+          TAG="ha-wheels-${{ needs.config.outputs.ha_version }}"
+          # List filenames already attached to this release, if it exists.
+          # A brand-new tag (first run for this HA version) just yields
+          # nothing here, so everything in to_build.txt proceeds normally.
+          gh release view "$TAG" --repo ${{ github.repository }} --json assets --jq '.assets[].name' \
+            > existing_assets.txt 2>/dev/null
+          set -e
+
+          : > to_build_filtered.txt
+          while IFS= read -r req; do
+            name=$(echo "$req" | grep -oE '^[A-Za-z0-9_.-]+' | tr 'A-Z' 'a-z' | sed -E 's/[-_.]+/_/g')
+            version=$(echo "$req" | grep -oP '(?<===)[0-9][A-Za-z0-9_.\-]*' | head -1)
+            # Wheel filenames (PEP 427) replace runs of -_. in the package
+            # name with a single underscore, since hyphen is the filename's
+            # own field separator — normalize the same way before matching.
+            # Also normalize the version per PEP 440 (e.g. 0.0.5-alpha -> 0.0.5a0),
+            # since that's the form that actually appears in built wheel filenames.
+            norm_version=$(python3 -c "from packaging.utils import canonicalize_version; print(canonicalize_version('$version'))" 2>/dev/null || echo "$version")
+            if grep -qi "${name}-${norm_version}" existing_assets.txt 2>/dev/null; then
+              echo "Already built, skipping: $req"
+            else
+              echo "$req" >> to_build_filtered.txt
+            fi
+          done < to_build.txt
+          mv to_build_filtered.txt to_build.txt
+
+          echo "Packages needing a build (after skip-existing filter):"
+          cat to_build.txt
           PKGS_JSON=$(jq -R -s -c 'split("\n") | map(select(length > 0))' to_build.txt)
           echo "to_build=$PKGS_JSON" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: needs-review-list
+          path: needs_review.txt
 
       - uses: actions/upload-artifact@v4
         with:
@@ -99,12 +171,69 @@ jobs:
           path: to_build.txt
 
   # ---------------------------------------------------------------
-  # 3. Build a wheel for each package that needs one (matrix)
+  # 3. Build (or reuse) a shared armv7 build environment image, once,
+  #    instead of apt-get installing the same packages in every one
+  #    of the ~128 matrix jobs below. Only rebuilds when the
+  #    Dockerfile actually changes (tag = content hash).
   # ---------------------------------------------------------------
-  build:
+  build-image:
     needs: [config, detect]
     if: needs.detect.outputs.to_build != '[]'
     runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.tag.outputs.image }}
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tag from Dockerfile hash + Python version
+        id: tag
+        run: |
+          HASH=$(cat docker/build-env.Dockerfile <(echo "${{ needs.config.outputs.py_version }}") | sha256sum | cut -c1-12)
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${REPO_LOWER}/ha-wheels-build-env:${HASH}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Check if this image already exists
+        id: check
+        run: |
+          if docker manifest inspect "${{ steps.tag.outputs.image }}" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push build environment (only if missing)
+        if: steps.check.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/build-env.Dockerfile
+          platforms: ${{ env.TARGET_PLATFORM }}
+          push: true
+          tags: ${{ steps.tag.outputs.image }}
+          build-args: |
+            PYTHON_VERSION=${{ needs.config.outputs.py_version }}
+
+  # ---------------------------------------------------------------
+  # 4. Build a wheel for each package that needs one (matrix)
+  # ---------------------------------------------------------------
+  build:
+    needs: [config, detect, build-image]
+    if: needs.detect.outputs.to_build != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
     strategy:
       fail-fast: false
       matrix:
@@ -113,29 +242,111 @@ jobs:
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
       - name: Build wheel for ${{ matrix.package }}
+        continue-on-error: true
+        timeout-minutes: 45
         run: |
           mkdir -p output
           docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
             -v "$PWD/output":/output \
-            python:${{ needs.config.outputs.py_version }}-bookworm \
+            -e PY_VERSION="${{ needs.config.outputs.py_version }}" \
+            ${{ needs.build-image.outputs.image }} \
             bash -c "
-              apt-get update && apt-get install -y build-essential gfortran libopenblas-dev &&
-              pip install --upgrade pip wheel &&
-              pip wheel '${{ matrix.package }}' -w /output --no-deps
+              PKG='${{ matrix.package }}' &&
+              CPTAG=\"cp\$(echo \\\"\$PY_VERSION\\\" | tr -d '.')\" &&
+              case \"\$PKG\" in
+                uv==*)
+                  # uv is a Rust binary; there's no Rust toolchain here
+                  # and no need for one — Astral already publishes an
+                  # official armv7 (manylinux_2_17_armv7l) wheel.
+                  VER=\"\${PKG#uv==}\" &&
+                  pip download --no-deps --dest /output --only-binary=:all: \
+                    --platform manylinux_2_17_armv7l --implementation cp \
+                    --python-version \"\$PY_VERSION\" --abi \"\$CPTAG\" \"uv==\$VER\" \
+                  || pip download --no-deps --dest /output --only-binary=:all: \
+                    --platform manylinux_2_17_armv7l \"uv==\$VER\"
+                  ;;
+                av==17.0.1)
+                  echo \"Building \$PKG against PyAV FFmpeg 8.1.2 ARMv7\"
+
+                  FFMPEG_VERSION=\"8.1.2-1\"
+                  FFMPEG_URL=\"https://github.com/PyAV-Org/pyav-ffmpeg/releases/download/\${FFMPEG_VERSION}/ffmpeg-manylinux-armv7l.tar.gz\"
+                  FFMPEG_SHA256=\"f5d9930c0bf1090b3a4cfb43ad01a017db7de97f8efc323662e1cc9466e9b26e\"
+
+                  FFMPEG_ROOT=\"/tmp/pyav-ffmpeg\"
+                  FFMPEG_ARCHIVE=\"/tmp/ffmpeg-armv7l.tar.gz\"
+
+                  rm -rf \"\$FFMPEG_ROOT\"
+                  mkdir -p \"\$FFMPEG_ROOT\"
+
+                  curl -L --fail --retry 3 \
+                    \"\$FFMPEG_URL\" \
+                    -o \"\$FFMPEG_ARCHIVE\"
+
+                  echo \"\${FFMPEG_SHA256}  \${FFMPEG_ARCHIVE}\" | sha256sum -c -
+
+                  tar -xzf \"\$FFMPEG_ARCHIVE\" -C \"\$FFMPEG_ROOT\"
+
+                  if [ -d \"\$FFMPEG_ROOT/include\" ] && [ -d \"\$FFMPEG_ROOT/lib\" ]; then
+                    FFMPEG_DIR=\"\$FFMPEG_ROOT\"
+                  else
+                    FFMPEG_DIR=\"\$(find \"\$FFMPEG_ROOT\" -mindepth 1 -maxdepth 1 -type d | head -1)\"
+                  fi
+
+                  echo \"Using FFmpeg directory: \$FFMPEG_DIR\"
+
+                  test -d \"\$FFMPEG_DIR/include\"
+                  test -d \"\$FFMPEG_DIR/lib\"
+                  test -d \"\$FFMPEG_DIR/lib/pkgconfig\"
+
+                  export PKG_CONFIG_PATH=\"\$FFMPEG_DIR/lib/pkgconfig\"
+                  export CFLAGS=\"-I\$FFMPEG_DIR/include \${CFLAGS:-}\"
+                  export CPPFLAGS=\"-I\$FFMPEG_DIR/include \${CPPFLAGS:-}\"
+                  export LDFLAGS=\"-L\$FFMPEG_DIR/lib \${LDFLAGS:-}\"
+                  export LD_LIBRARY_PATH=\"\$FFMPEG_DIR/lib:\${LD_LIBRARY_PATH:-}\"
+
+                  echo \"PKG_CONFIG_PATH=\$PKG_CONFIG_PATH\"
+                  echo \"CFLAGS=\$CFLAGS\"
+                  echo \"LDFLAGS=\$LDFLAGS\"
+
+                  pkg-config --modversion libavformat
+                  pkg-config --modversion libavcodec
+                  pkg-config --modversion libavutil
+
+                  pip install \"cython==3.2.4\" setuptools wheel
+
+                  pip wheel \"\$PKG\" \
+                    --no-binary av \
+                    --no-build-isolation \
+                    -w /output
+                  ;;
+                *)
+                  pip wheel \"\$PKG\" -w /output
+                  ;;
+              esac
             "
 
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.package }}
           path: output/*.whl
+          if-no-files-found: error
 
   # ---------------------------------------------------------------
   # 4. Collect all built wheels and publish as a GitHub Release
   # ---------------------------------------------------------------
   publish:
     needs: [config, build]
+    if: always()
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -146,9 +357,87 @@ jobs:
       - name: List built wheels
         run: ls -la dist
 
+      - name: Set release tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.test_package }}" ]; then
+            echo "tag=ha-wheels-test" >> "$GITHUB_OUTPUT"
+            echo "title=HA armv7 wheels — TEST" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=ha-wheels-${{ needs.config.outputs.ha_version }}" >> "$GITHUB_OUTPUT"
+            echo "title=HA armv7 wheels — ${{ needs.config.outputs.ha_version }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ha-wheels-${{ needs.config.outputs.ha_version }}
-          name: HA armv7 wheels — ${{ needs.config.outputs.ha_version }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.title }}
           files: dist/*.whl
           fail_on_unmatched_files: false
+
+  # ---------------------------------------------------------------
+  # 5. Publish a real PEP 503 "simple" package index (like PyPI/piwheels)
+  #    via GitHub Pages, generated from the real release's assets.
+  #    Never runs for test_package runs, so test wheels can never leak
+  #    into the published index.
+  # ---------------------------------------------------------------
+  publish-index:
+    needs: [config, publish]
+    if: >
+      always() &&
+      needs.publish.result == 'success' &&
+      github.event.inputs.test_package == ''
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Generate PEP 503 simple index from release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ha-wheels-${{ needs.config.outputs.ha_version }}
+        run: |
+          gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' > filenames.txt
+          python3 <<'PYEOF'
+          import re, os
+
+          repo = os.environ["REPO"]
+          tag = os.environ["TAG"]
+
+          with open("filenames.txt") as f:
+              filenames = [l.strip() for l in f if l.strip().endswith(".whl")]
+
+          packages = {}
+          for fn in filenames:
+              raw_name = fn.split("-")[0]
+              norm = re.sub(r"[-_.]+", "-", raw_name).lower()
+              url = f"https://github.com/{repo}/releases/download/{tag}/{fn}"
+              packages.setdefault(norm, []).append((fn, url))
+
+          os.makedirs("site/simple", exist_ok=True)
+          with open("site/simple/index.html", "w") as f:
+              f.write("<!DOCTYPE html><html><body>\n")
+              for name in sorted(packages):
+                  f.write(f'<a href="{name}/">{name}</a><br>\n')
+              f.write("</body></html>\n")
+
+          for name, files in packages.items():
+              d = f"site/simple/{name}"
+              os.makedirs(d, exist_ok=True)
+              with open(f"{d}/index.html", "w") as f:
+                  f.write("<!DOCTYPE html><html><body>\n")
+                  for fn, url in files:
+                      f.write(f'<a href="{url}">{fn}</a><br>\n')
+                  f.write("</body></html>\n")
+          PYEOF
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - uses: actions/deploy-pages@v4
+        id: deployment
