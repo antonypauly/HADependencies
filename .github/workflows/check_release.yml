@@ -1,0 +1,58 @@
+name: Check for new HA release
+
+on:
+  schedule:
+    - cron: "17 5 * * *"   # daily at 05:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write   # needed to list runs and dispatch the build workflow
+
+# Never run two checks at once (avoids a double dispatch)
+concurrency:
+  group: check-ha-release
+  cancel-in-progress: false
+
+env:
+  # gh accepts either the workflow's file name or its `name:` value
+  BUILD_WORKFLOW: "Build HA Wheels for armv7"
+  RUN_NAME_PREFIX: "Build HA wheels "   # must match run-name in the build workflow, minus the version
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find latest HA release and dispatch build if not attempted yet
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # /releases/latest skips prereleases, so betas are ignored
+          ha_version=$(gh api repos/home-assistant/core/releases/latest --jq .tag_name)
+          echo "Latest HA release: ${ha_version}"
+
+          # 1) Already built and published?
+          if gh release view "ha-wheels-${ha_version}" >/dev/null 2>&1; then
+            echo "Release ha-wheels-${ha_version} already exists. Nothing to do."
+            exit 0
+          fi
+
+          # 2) Already attempted (success, failure, or still running)?
+          attempted=$(gh run list \
+            --workflow "${BUILD_WORKFLOW}" \
+            --limit 100 \
+            --json displayTitle \
+            --jq "[.[] | select(.displayTitle == \"${RUN_NAME_PREFIX}${ha_version}\")] | length")
+
+          if [ "${attempted}" -gt 0 ]; then
+            echo "Build for ${ha_version} was already attempted (${attempted} run(s)). Skipping."
+            echo "If it failed, fix the cause and re-run the build workflow manually."
+            exit 0
+          fi
+
+          # 3) New version, no attempt yet
+          echo "Dispatching build for ${ha_version}"
+          gh workflow run "${BUILD_WORKFLOW}" -f homeassistant_version="${ha_version}"

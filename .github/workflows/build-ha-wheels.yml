@@ -1,4 +1,5 @@
 name: Build HA Wheels for armv7
+run-name: Build HA wheels ${{ inputs.homeassistant_version }}
 
 on:
   push:
@@ -328,21 +329,33 @@ jobs:
   # ---------------------------------------------------------------
   publish:
     needs: [config, build]
-    if: always()
+    # !cancelled() instead of always(): no publishing after a cancel.
+    # config must have succeeded, otherwise the tag would be "ha-wheels-".
+    if: ${{ !cancelled() && needs.config.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      wheel_count: ${{ steps.count.outputs.count }}
     steps:
       - uses: actions/download-artifact@v4
+        continue-on-error: true   # no wheel-* artifacts is a valid outcome
         with:
           pattern: wheel-*
           path: dist
           merge-multiple: true
-
-      - name: List built wheels
-        run: ls -la dist
-
+ 
+      - name: Count built wheels
+        id: count
+        run: |
+          mkdir -p dist
+          n=$(find dist -name '*.whl' | wc -l)
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          echo "Built wheels: $n"
+          ls -la dist
+ 
       - name: Set release tag
+        if: steps.count.outputs.count != '0'
         id: tag
         run: |
           if [ -n "${{ github.event.inputs.test_package }}" ]; then
@@ -352,25 +365,26 @@ jobs:
             echo "tag=ha-wheels-${{ needs.config.outputs.ha_version }}" >> "$GITHUB_OUTPUT"
             echo "title=HA armv7 wheels — ${{ needs.config.outputs.ha_version }}" >> "$GITHUB_OUTPUT"
           fi
-
+ 
       - uses: softprops/action-gh-release@v2
+        if: steps.count.outputs.count != '0'
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.title }}
           files: dist/*.whl
           fail_on_unmatched_files: false
-
+ 
   # ---------------------------------------------------------------
-  # 5. Publish a real PEP 503 "simple" package index (like PyPI/piwheels)
-  #    via GitHub Pages, generated from the real release's assets.
-  #    Never runs for test_package runs, so test wheels can never leak
-  #    into the published index.
+  # 5. Publish a real PEP 503 "simple" package index via GitHub Pages,
+  #    generated from the real release's assets.
+  #    Skipped for test_package runs and when no new wheels were built.
   # ---------------------------------------------------------------
   publish-index:
     needs: [config, publish]
     if: >
-      always() &&
+      !cancelled() &&
       needs.publish.result == 'success' &&
+      needs.publish.outputs.wheel_count != '0' &&
       github.event.inputs.test_package == ''
     runs-on: ubuntu-latest
     permissions:
@@ -388,10 +402,10 @@ jobs:
         run: |
           bash scripts/list_wheels.sh "$GITHUB_REPOSITORY" all_wheels.tsv
           python3 scripts/make_index.py all_wheels.tsv site
-
+ 
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
-
+ 
       - uses: actions/deploy-pages@v4
         id: deployment
