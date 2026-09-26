@@ -253,7 +253,7 @@ jobs:
 
       - name: Build wheel for ${{ matrix.package }}
         continue-on-error: true
-        timeout-minutes: 45
+        timeout-minutes: 90
         run: |
           mkdir -p output
           docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
@@ -339,7 +339,7 @@ jobs:
                   rmdir /output/fixed
                   ;;
                 *)
-                  pip wheel \"\$PKG\" -w /output
+                  pip wheel \"\$PKG\" -w /output --extra-index-url https://antonypauly.github.io/HADependencies/simple/
                   ;;
               esac
             "
