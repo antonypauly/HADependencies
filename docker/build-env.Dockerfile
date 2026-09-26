@@ -10,7 +10,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     curl \
     ca-certificates \
-    patchelf \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade pip setuptools wheel auditwheel
+RUN pip install --upgrade pip setuptools wheel auditwheel "patchelf>=0.17"
