@@ -1,5 +1,5 @@
 ARG PYTHON_VERSION=3.14
-FROM python:${PYTHON_VERSION}-trixie
+FROM python:${PYTHON_VERSION}-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -12,4 +12,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade pip setuptools wheel
+RUN pip install --upgrade pip setuptools wheel auditwheel "patchelf>=0.17"

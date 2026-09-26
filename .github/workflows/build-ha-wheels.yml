@@ -328,12 +328,27 @@ jobs:
                     --no-binary av \
                     --no-build-isolation \
                     -w /output
+
+                  # Repair while LD_LIBRARY_PATH/FFMPEG_DIR are still valid in this container
+                  mkdir -p /output/fixed
+                  auditwheel repair /output/av-*.whl \
+                    -w /output/fixed \
+                    --plat manylinux_2_34_armv7l
+                  rm -f /output/av-*.whl
+                  mv /output/fixed/*.whl /output/
+                  rmdir /output/fixed
                   ;;
                 *)
                   pip wheel \"\$PKG\" -w /output
                   ;;
               esac
             "
+      - name: Make wheels portable (auditwheel)
+        run: |
+          docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
+            -v "$PWD/output":/output \
+            ${{ needs.build-image.outputs.image }} \
+            bash -c 'mkdir -p /fixed && for w in /output/*.whl; do auditwheel repair "$w" -w /fixed || cp "$w" /fixed/; done && rm -f /output/*.whl && mv /fixed/*.whl /output/'
 
       - uses: actions/upload-artifact@v4
         with:
