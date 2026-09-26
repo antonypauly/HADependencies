@@ -334,7 +334,13 @@ jobs:
                   ;;
               esac
             "
-
+      - name: Make wheels portable (auditwheel)
+        run: |
+          docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
+            -v "$PWD/output":/output \
+            ${{ needs.build-image.outputs.image }} \
+            bash -c 'mkdir -p /fixed && for w in /output/*.whl; do auditwheel repair "$w" -w /fixed || cp "$w" /fixed/; done && rm -f /output/*.whl && mv /fixed/*.whl /output/'
+            
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.package }}
