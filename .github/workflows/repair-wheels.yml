@@ -1,0 +1,71 @@
+name: Repair execstack in published wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_filter:
+        description: "Only repair releases matching this tag (optional, e.g. ha-wheels-2026.9.3). Leave empty for all releases."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install tools
+        run: pip install --quiet wheel "patchelf>=0.17"
+
+      - name: Repair wheels in all matching releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG_FILTER: ${{ inputs.tag_filter }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$TAG_FILTER" ]; then
+            tags="$TAG_FILTER"
+          else
+            tags=$(gh release list --repo "$REPO" --limit 200 --json tagName -q '.[].tagName')
+          fi
+
+          for tag in $tags; do
+            echo "=== Release: $tag ==="
+            assets=$(gh release view "$tag" --repo "$REPO" --json assets -q '.assets[].name' | grep '\.whl$' || true)
+            [ -z "$assets" ] && { echo "  no wheels, skipping"; continue; }
+
+            for asset in $assets; do
+              echo "-- $asset"
+              work=$(mktemp -d)
+              gh release download "$tag" --repo "$REPO" --pattern "$asset" --dir "$work"
+              whl="$work/$asset"
+
+              dir=$(mktemp -d)
+              wheel unpack "$whl" -d "$dir"
+              pkgdir=$(find "$dir" -mindepth 1 -maxdepth 1 -type d)
+
+              fixed=0
+              while IFS= read -r -d '' so; do
+                if readelf -l "$so" 2>/dev/null | grep -A1 'GNU_STACK' | grep -q 'RWE'; then
+                  echo "   clearing execstack: $so"
+                  patchelf --clear-execstack "$so"
+                  fixed=1
+                fi
+              done < <(find "$pkgdir" -name '*.so*' -print0)
+
+              if [ "$fixed" -eq 1 ]; then
+                rm -f "$whl"
+                wheel pack "$pkgdir" -d "$work"
+                new_whl=$(ls "$work"/*.whl | head -1)
+                echo "   uploading repaired wheel (same filename, overwriting)"
+                gh release upload "$tag" "$new_whl" --repo "$REPO" --clobber
+              else
+                echo "   no execstack issue found, leaving as-is"
+              fi
+
+              rm -rf "$dir" "$work"
+            done
+          done
