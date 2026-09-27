@@ -16,7 +16,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install tools
-        run: pip install --quiet wheel "patchelf>=0.17"
+        run: |
+          pip install --quiet wheel "patchelf>=0.17"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Repair wheels in all matching releases
         env:
