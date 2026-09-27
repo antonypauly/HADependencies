@@ -135,7 +135,12 @@ jobs:
             PY_VERSION: ${{ needs.config.outputs.py_version }}
           run: |
             pip install --quiet packaging
-            python3 scripts/resolve_requirements.py "$PY_VERSION" combined_requirements.txt to_build.txt needs_review.txt
+            python3 scripts/resolve_requirements.py \
+                  "$PY_VERSION" \
+                  combined_requirements.txt \
+                  homeassistant/package_constraints.txt \
+                  to_build.txt \
+                  needs_review.txt
             echo "Packages needing a build (before skip-existing filter):"
             cat to_build.txt
             echo "Skipped/unresolved — check manually:"
