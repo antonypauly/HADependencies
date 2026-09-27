@@ -571,30 +571,39 @@ def resolve_requirement(requirement, constraints, files=None):
     return chosen, version_str, versions[chosen]
 
 
+
 # ---------------------------------------------------------------------------
 # Dependency traversal
 # ---------------------------------------------------------------------------
+
+class ResolvedVersion:
+    __slots__ = ("requirement", "version", "version_str")
+
+    def __init__(self, requirement, version, version_str):
+        self.requirement = requirement
+        self.version = version
+        self.version_str = version_str
+
 
 class Resolver:
     def __init__(self, constraints):
         self.constraints = constraints
 
-        # canonical package name -> selected Version
+        # canonical package name -> list[ResolvedVersion]
+        #
+        # Usually one entry. More than one means two or more dependents
+        # want versions of this package that cannot be reconciled into
+        # a single specifier (e.g. one exact pin vs. an incompatible
+        # range) -- every such version gets built, since HA installs
+        # each integration's requirements independently and may need
+        # any of them depending on which integration is being set up.
         self.resolved = {}
 
-        # canonical package name -> the (possibly merged) Requirement
-        # currently used to select that version
-        self.resolved_requirements = {}
-
-        # canonical package name -> list of reasons
-        self.review = []
-
-        # Packages whose metadata has already been traversed.
+        # (name, version_str) -> True, once its Requires-Dist has been
+        # walked, so we never expand the same release twice.
         self.expanded = set()
 
-        # Guards resolved / resolved_requirements / expanded, since
-        # top-level requirements are resolved concurrently and may
-        # recursively resolve overlapping transitive dependencies.
+        self.review = []
         self.lock = threading.RLock()
 
     def add_review(self, requirement, reason):
@@ -607,18 +616,10 @@ class Resolver:
         """
         Combine two Requirement objects for the same canonical package
         name into one synthetic Requirement whose specifier is the
-        intersection (AND) of both. Markers are dropped since both
-        requirements have already been confirmed to apply to the
-        target environment individually.
-
-        Returns None only if the combined line is not syntactically
-        parseable. An unsatisfiable-but-well-formed combination (e.g.
-        two conflicting exact pins) is still returned, so that
-        resolve_requirement() reports *why* nothing satisfies it,
-        rather than us guessing based on who resolved first.
+        intersection (AND) of both. Returns None only if the combined
+        line is not syntactically parseable.
         """
         name = req_a.name
-
         spec_parts = [str(req_a.specifier), str(req_b.specifier)]
         spec_parts = [part for part in spec_parts if part]
         merged_spec = ",".join(spec_parts)
@@ -626,22 +627,22 @@ class Resolver:
         extras = sorted(set(req_a.extras) | set(req_b.extras))
         extras_str = f"[{','.join(extras)}]" if extras else ""
 
-        line = f"{name}{extras_str}{merged_spec}"
-
         try:
-            return Requirement(line)
+            return Requirement(f"{name}{extras_str}{merged_spec}")
         except InvalidRequirement:
             return None
 
     def resolve(self, requirement, source=None):
         """
-        Resolve one requirement and recursively resolve its dependencies.
+        Resolve one requirement. If it's compatible with a version
+        already resolved for this package name, it's folded into that
+        version's requirement (narrowing it, if needed). If it is NOT
+        compatible with any already-resolved version, it is resolved
+        independently and added as an ADDITIONAL version for this
+        package name, rather than discarded or forced to "win" over
+        the existing one.
 
-        If a different requirement for the same package name has
-        already been resolved, the two requirements' specifiers are
-        combined and re-resolved together, instead of discarding
-        whichever requirement loses a thread-scheduling race. Returns
-        the selected Version, or None if resolution failed outright.
+        Returns the chosen Version, or None on outright failure.
         """
         name = canonicalize_name(requirement.name)
 
@@ -659,114 +660,127 @@ class Resolver:
             return None
 
         with self.lock:
-            existing_requirement = self.resolved_requirements.get(name)
-            existing_version = self.resolved.get(name)
+            existing_group = list(self.resolved.get(name, []))
 
-        if existing_requirement is not None:
-            effective_requirement = self._merge_requirements(
-                existing_requirement, requirement
+        # Try to fold this requirement into each already-resolved
+        # version for this name, in turn.
+        for entry in existing_group:
+            merged_requirement = self._merge_requirements(
+                entry.requirement, requirement
             )
 
-            if effective_requirement is None:
-                self.add_review(
-                    str(requirement),
-                    f"cannot combine with already resolved requirement "
-                    f"for {name} ({existing_requirement})",
-                )
-                return existing_version
-        else:
-            effective_requirement = requirement
+            if merged_requirement is None:
+                continue
 
+            try:
+                chosen, version_str, reason_or_files = resolve_requirement(
+                    merged_requirement, self.constraints, files
+                )
+            except Exception:
+                continue
+
+            if chosen is None:
+                continue
+
+            with self.lock:
+                entry.requirement = merged_requirement
+
+                if version_str != entry.version_str:
+                    entry.version = chosen
+                    entry.version_str = version_str
+
+            # Compatible with (and folded into) an existing version --
+            # no new version needs to be added or expanded again
+            # unless the version actually changed.
+            self._maybe_expand(name, entry, requirement, source)
+            return entry.version
+
+        # Not compatible with any existing resolved version for this
+        # name (or there were none yet) -- resolve independently.
         try:
-            chosen, version_str, chosen_files = resolve_requirement(
-                effective_requirement,
-                self.constraints,
-                files,
+            chosen, version_str, reason_or_files = resolve_requirement(
+                requirement, self.constraints, files
             )
         except Exception as exc:
             self.add_review(str(requirement), f"resolution error: {exc}")
-            return existing_version
-
-        if chosen is None:
-            if existing_requirement is not None:
-                self.add_review(
-                    str(requirement),
-                    f"dependency conflict: combined requirement "
-                    f"{effective_requirement} for {name} is unsatisfiable "
-                    f"(already resolved {name}=={existing_version}); "
-                    f"{version_str}",
-                )
-                return existing_version
-
-            self.add_review(str(requirement), version_str)
             return None
 
+        if chosen is None:
+            reason = reason_or_files or "no compatible release found"
+
+            if existing_group:
+                other_versions = ", ".join(
+                    f"{name}=={e.version_str}" for e in existing_group
+                )
+                self.add_review(
+                    str(requirement),
+                    f"cannot satisfy this requirement even independently "
+                    f"of already-resolved version(s) {other_versions}; "
+                    f"{reason}",
+                )
+            else:
+                self.add_review(str(requirement), reason)
+
+            return None
+
+        new_entry = ResolvedVersion(requirement, chosen, version_str)
+
         with self.lock:
-            previous_version = self.resolved.get(name)
-            same_version = (
-                previous_version is not None
-                and str(previous_version) == version_str
+            self.resolved.setdefault(name, []).append(new_entry)
+
+        if existing_group:
+            other_versions = ", ".join(
+                f"{name}=={e.version_str}" for e in existing_group
             )
-
-            self.resolved[name] = chosen
-            self.resolved_requirements[name] = effective_requirement
-
-            if same_version:
-                # Version unchanged -- the stored requirement is now
-                # tighter, but there's no need to re-walk dependencies.
-                return chosen
-
-        origin = f" (required by {source})" if source else ""
-
-        if previous_version is not None:
             print(
-                f"Re-resolved {requirement}{origin} -> {name}=={version_str} "
-                f"(was {previous_version}, now satisfies combined "
-                f"requirement {effective_requirement})"
+                f"Resolved {requirement} -> {name}=={version_str} "
+                f"(ALSO building {other_versions} for other dependents)"
             )
         else:
+            origin = f" (required by {source})" if source else ""
             print(f"Resolved {requirement}{origin} -> {name}=={version_str}")
 
-        # ------------------------------------------------------------------
-        # Recursively inspect Requires-Dist for this exact release.
-        # ------------------------------------------------------------------
-        metadata = fetch_release_metadata(name, version_str)
+        self._maybe_expand(name, new_entry, requirement, source)
+        return chosen
+
+    def _maybe_expand(self, name, entry, requirement, source):
+        """Walk Requires-Dist for entry's release, once per release."""
+        key = (name, entry.version_str)
+
+        with self.lock:
+            if key in self.expanded:
+                return
+            self.expanded.add(key)
+
+        metadata = fetch_release_metadata(name, entry.version_str)
 
         if isinstance(metadata, Exception):
             self.add_review(
-                f"{name}=={version_str}",
+                f"{name}=={entry.version_str}",
                 f"metadata lookup failed: {metadata}",
             )
-            return chosen
+            return
 
         if metadata is None:
             self.add_review(
-                f"{name}=={version_str}",
+                f"{name}=={entry.version_str}",
                 "release metadata not found on PyPI",
             )
-            return chosen
+            return
 
-        requires_dist = metadata.get("requires_dist") or []
-
-        if not requires_dist:
-            return chosen
-
-        with self.lock:
-            self.expanded.add(name)
-
-        for dependency_line in requires_dist:
+        for dependency_line in metadata.get("requires_dist") or []:
             try:
                 dependency = Requirement(dependency_line)
             except InvalidRequirement as exc:
                 self.add_review(
-                    f"{name}=={version_str} -> {dependency_line}",
+                    f"{name}=={entry.version_str} -> {dependency_line}",
                     f"cannot parse dependency: {exc}",
                 )
                 continue
 
             if dependency.url:
                 self.add_review(
-                    f"{name}=={version_str} -> {dependency_line}",
+                    f"{name}=={entry.version_str} -> {dependency_line}",
                     "direct URL dependency",
                 )
                 continue
@@ -774,9 +788,7 @@ class Resolver:
             if not marker_applies(dependency):
                 continue
 
-            self.resolve(dependency, source=f"{name}=={version_str}")
-
-        return chosen
+            self.resolve(dependency, source=f"{name}=={entry.version_str}")
 
 # ---------------------------------------------------------------------------
 # Main
@@ -846,8 +858,18 @@ def main():
     skipped = 0
 
     resolved_items = sorted(
-        resolver.resolved.items(),
-        key=lambda item: item[0],
+        (
+            (name, entry.version_str)
+            for name, entries in resolver.resolved.items()
+            for entry in entries
+        ),
+        key=lambda item: (item[0], item[1]),
+    )
+
+    print(
+        f"Checking ARMv7 wheels for "
+        f"{len(resolved_items)} resolved package versions "
+        f"({len(resolver.resolved)} distinct package names)..."
     )
 
     print(
