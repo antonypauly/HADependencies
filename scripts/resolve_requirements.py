@@ -859,11 +859,11 @@ def main():
 
     resolved_items = sorted(
         (
-            (name, entry.version_str)
+            (name, entry.version)
             for name, entries in resolver.resolved.items()
             for entry in entries
         ),
-        key=lambda item: (item[0], item[1]),
+        key=lambda item: (item[0], str(item[1])),
     )
 
     print(
