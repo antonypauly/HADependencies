@@ -349,12 +349,66 @@ jobs:
             -v "$PWD/output":/output \
             ${{ needs.build-image.outputs.image }} \
             bash -c 'mkdir -p /fixed && for w in /output/*.whl; do auditwheel repair "$w" -w /fixed || cp "$w" /fixed/; done && rm -f /output/*.whl && mv /fixed/*.whl /output/'
+     
+      - name: Fix execstack and verify compiled wheels
+        run: |
+          docker run --rm --platform ${{ env.TARGET_PLATFORM }} \
+            -v "$PWD/output":/output \
+            ${{ needs.build-image.outputs.image }} \
+            bash -c '
+              set -e
+              for whl in /output/*.whl; do
+                dir=$(mktemp -d)
+                wheel unpack "$whl" -d "$dir"
+                pkgdir=$(find "$dir" -mindepth 1 -maxdepth 1 -type d)
+
+                has_so=0
+                fixed=0
+                while IFS= read -r -d "" so; do
+                  has_so=1
+                  if readelf -l "$so" 2>/dev/null | grep -A1 "GNU_STACK" | grep -q "RWE"; then
+                    echo "Clearing execstack: $so"
+                    patchelf --clear-execstack "$so"
+                    fixed=1
+                  fi
+                done < <(find "$pkgdir" -name "*.so*" -print0)
+
+                if [ "$fixed" -eq 1 ]; then
+                  rm -f "$whl"
+                  wheel pack "$pkgdir" -d /output
+                  whl="/output/$(basename "$(ls /output/*.whl | head -1)")"
+                  echo "Repaired: $(basename "$whl")"
+                fi
+
+                if [ "$has_so" -eq 1 ]; then
+                  top_level_file=$(find "$pkgdir" -name "top_level.txt" | head -1)
+                  if [ -n "$top_level_file" ]; then
+                    echo "Verifying import(s) for $(basename "$whl")"
+                    python -m venv /tmp/verify-venv
+                    /tmp/verify-venv/bin/pip install --quiet \
+                      --find-links=/output \
+                      --extra-index-url https://antonypauly.github.io/HADependencies/simple/ \
+                      "$whl"
+                    while IFS= read -r mod; do
+                      [ -z "$mod" ] && continue
+                      /tmp/verify-venv/bin/python -c "import $mod; print(\"$mod import OK\")"
+                    done < "$top_level_file"
+                    rm -rf /tmp/verify-venv
+                  else
+                    echo "WARNING: $(basename "$whl") has compiled extensions but no top_level.txt found, skipping import check"
+                  fi
+                fi
+
+                rm -rf "$dir"
+              done
+            '
 
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.package }}
           path: output/*.whl
           if-no-files-found: error
+
 
   # ---------------------------------------------------------------
   # 4. Collect all built wheels and publish as a GitHub Release
