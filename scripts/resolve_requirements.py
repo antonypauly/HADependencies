@@ -872,11 +872,6 @@ def main():
         f"({len(resolver.resolved)} distinct package names)..."
     )
 
-    print(
-        f"Checking ARMv7 wheels for "
-        f"{len(resolved_items)} resolved packages..."
-    )
-
     def check_wheel(name, version):
         files = fetch(name)
 
