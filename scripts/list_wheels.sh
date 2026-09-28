@@ -19,7 +19,6 @@ OUT="$2"
 gh api --paginate "repos/${REPO}/releases?per_page=100" \
   --jq '.[]
         | select(.tag_name | startswith("ha-wheels-"))
-        | select(.tag_name != "ha-wheels-test")
         | [.id, .tag_name] | @tsv' \
 | while IFS=$'\t' read -r id tag; do
     gh api --paginate "repos/${REPO}/releases/${id}/assets?per_page=100" \
