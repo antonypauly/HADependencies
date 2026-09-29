@@ -3,6 +3,8 @@ FROM python:${PYTHON_VERSION}-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    cmake \
+    ninja-build \
     gfortran \
     libopenblas-dev \
     pkg-config \
