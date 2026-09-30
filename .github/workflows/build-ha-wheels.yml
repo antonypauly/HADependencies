@@ -362,6 +362,8 @@ jobs:
             ${{ needs.build-image.outputs.image }} \
             bash -c '
               set -e
+              failed=0
+
               for whl in /output/*.whl; do
                 dir=$(mktemp -d)
                 wheel unpack "$whl" -d "$dir"
@@ -379,33 +381,47 @@ jobs:
                 done < <(find "$pkgdir" -name "*.so*" -print0)
 
                 if [ "$fixed" -eq 1 ]; then
+                  newdir=$(mktemp -d)
+                  wheel pack "$pkgdir" -d "$newdir"
+                  newwhl=$(ls "$newdir"/*.whl | head -1)
                   rm -f "$whl"
-                  wheel pack "$pkgdir" -d /output
-                  whl="/output/$(basename "$(ls /output/*.whl | head -1)")"
+                  mv "$newwhl" /output/
+                  whl="/output/$(basename "$newwhl")"
+                  rm -rf "$newdir"
                   echo "Repaired: $(basename "$whl")"
                 fi
 
                 if [ "$has_so" -eq 1 ]; then
-                  top_level_file=$(find "$pkgdir" -name "top_level.txt" | head -1)
-                  if [ -n "$top_level_file" ]; then
+                  mods=$(cd "$pkgdir" && find . \( -name "*.cpython-*.so" -o -name "*.abi3.so" \) \
+                    -not -path "*.libs/*" -print \
+                    | sed -E "s#^\./##; s#\.(cpython-[^/]*|abi3)\.so\$##; s#/#.#g")
+
+                  if [ -z "$mods" ]; then
+                    echo "WARNING: $(basename "$whl") has .so files but no importable extension modules found, skipping import check"
+                  else
                     echo "Verifying import(s) for $(basename "$whl")"
                     python -m venv /tmp/verify-venv
-                    /tmp/verify-venv/bin/pip install --quiet \
-                      --find-links=/output \
-                      --extra-index-url https://antonypauly.github.io/HADependencies/simple/ \
-                      "$whl"
-                    while IFS= read -r mod; do
-                      [ -z "$mod" ] && continue
-                      /tmp/verify-venv/bin/python -c "import $mod; print(\"$mod import OK\")"
-                    done < "$top_level_file"
+                    if ! /tmp/verify-venv/bin/pip install --quiet \
+                        --find-links=/output \
+                        --extra-index-url https://antonypauly.github.io/HADependencies/simple/ \
+                        "$whl"; then
+                      echo "FAILED: pip install of $(basename "$whl")"
+                      failed=1
+                      rm -rf /tmp/verify-venv "$dir"
+                      continue
+                    fi
+                    for mod in $mods; do
+                      /tmp/verify-venv/bin/python -c "import $mod; print(\"$mod import OK\")" \
+                        || { echo "FAILED: import $mod from $(basename "$whl")"; failed=1; }
+                    done
                     rm -rf /tmp/verify-venv
-                  else
-                    echo "WARNING: $(basename "$whl") has compiled extensions but no top_level.txt found, skipping import check"
                   fi
                 fi
 
                 rm -rf "$dir"
               done
+
+              exit $failed
             '
 
       - uses: actions/upload-artifact@v4
