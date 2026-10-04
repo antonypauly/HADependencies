@@ -49,4 +49,4 @@ for name, files in packages.items():
 print(f"Indexed {len(seen)} wheels for {len(packages)} packages", file=sys.stderr)
 landing = Path(__file__).resolve().parent.parent / "pages" / "index.html"
 if landing.exists():
-    shutil.copy(landing, Path(out_dir) / "index.html")
+    shutil.copy(landing, Path(out) / "index.html")
