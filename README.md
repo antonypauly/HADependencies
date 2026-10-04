@@ -40,20 +40,21 @@ ldd --version
 
 ### 2. Add the index to uv's config
 
-Add the following to your uv config file (for example `/etc/uv/uv.toml`):
+Create a system-wide uv config so DietPi's installer doesn't overwrite it:
 
-```toml
+```bash
+sudo mkdir -p /etc/uv
+sudo tee /etc/uv/uv.toml > /dev/null <<'EOF'
 index-strategy = "unsafe-best-match"
 
 [[index]]
 url = "https://antonypauly.github.io/HADependencies/simple/"
-
-[[index]]
-url = "https://www.piwheels.org/simple"
+EOF
 ```
 
-[piwheels](https://www.piwheels.org/) is optional and third-party; it
-fills in packages this repo doesn't build.
+This applies to all uv commands on the machine. DietPi's own config at
+`/opt/homeassistant/.config/uv/uv.toml` (which only contains
+`no-cache = true`) can stay as it is.
 
 ### 3. Install or reinstall Home Assistant
 
