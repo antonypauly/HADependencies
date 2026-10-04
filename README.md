@@ -43,7 +43,7 @@ Expected output:
 ```
 armv7l
 ldd (Debian GLIBC 2.36-9+rpt2+deb12u9) 2.36
-=```
+```
 
 - `uname -m` must print `armv7l`. On `aarch64` (64-bit) these wheels
   aren't needed.
