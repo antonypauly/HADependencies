@@ -9,6 +9,8 @@ wins, which is the newest release since list_wheels.sh emits newest first.
 import os
 import re
 import sys
+import shutil
+from pathlib import Path
 
 tsv, out = sys.argv[1:3]
 
@@ -45,3 +47,6 @@ for name, files in packages.items():
         f.write("</body></html>\n")
 
 print(f"Indexed {len(seen)} wheels for {len(packages)} packages", file=sys.stderr)
+landing = Path(__file__).resolve().parent.parent / "pages" / "index.html"
+if landing.exists():
+    shutil.copy(landing, Path(out_dir) / "index.html")
