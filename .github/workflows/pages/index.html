@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HA armv7 Wheels</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.5; }
+    pre { background: #f4f4f4; padding: 1rem; overflow-x: auto; }
+    @media (prefers-color-scheme: dark) { body { background: #111; color: #eee; } pre { background: #222; } a { color: #8ab4f8; } }
+  </style>
+</head>
+<body>
+  <h1>HA armv7 Wheels</h1>
+  <p>Prebuilt Python wheels for 32-bit ARM (armv7l), for running Home Assistant
+  Core on a Raspberry Pi with DietPi. This is an unofficial, third-party package
+  index, so only use it if you trust the
+  <a href="https://github.com/antonypauly/HADependencies">source repository</a>.</p>
+
+  <h2>Use it with uv</h2>
+  <pre>index-strategy = "unsafe-best-match"
+
+[[index]]
+url = "https://antonypauly.github.io/HADependencies/simple/"</pre>
+
+  <p>Full instructions are in the
+  <a href="https://github.com/antonypauly/HADependencies#readme">README</a>.</p>
+  <p><a href="simple/">Browse the package index</a></p>
+</body>
+</html>
