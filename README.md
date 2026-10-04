@@ -34,9 +34,23 @@ uses `uv`. To make it pull wheels from this index:
 ### 1. Check that your system matches
 
 ```bash
-uname -m    # must print armv7l
-ldd --version
+uname -m
+ldd --version | head -n1
 ```
+
+Expected output:
+
+```
+armv7l
+ldd (Debian GLIBC 2.36-9+rpt2+deb12u9) 2.36
+=```
+
+- `uname -m` must print `armv7l`. On `aarch64` (64-bit) these wheels
+  aren't needed.
+- The glibc version is the number at the end of the `ldd` line. It must
+  be **2.36 or newer**. That corresponds to Debian 12 (bookworm, glibc
+  2.36) or Debian 13 (trixie, glibc 2.41). Older systems such as Debian
+  11 (bullseye, glibc 2.31) are too old for these wheels.
 
 ### 2. Add the index to uv's config
 
