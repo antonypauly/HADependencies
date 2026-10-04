@@ -40,7 +40,9 @@ ldd --version
 
 ### 2. Add the index to uv's config
 
-Create a system-wide uv config so DietPi's installer doesn't overwrite it:
+Create a system-wide uv config so DietPi's installer doesn't overwrite it.
+
+**If `/etc/uv/uv.toml` does not exist** (check with `ls /etc/uv/uv.toml`):
 
 ```bash
 sudo mkdir -p /etc/uv
@@ -50,6 +52,18 @@ index-strategy = "unsafe-best-match"
 [[index]]
 url = "https://antonypauly.github.io/HADependencies/simple/"
 EOF
+```
+
+**If it already exists**, don't overwrite it. Open it with
+`sudo nano /etc/uv/uv.toml` and add:
+
+- the line `index-strategy = "unsafe-best-match"` near the top, unless it
+  is already set (a key can only appear once, or uv will refuse to read the file)
+- this block at the end of the file:
+
+```toml
+[[index]]
+url = "https://antonypauly.github.io/HADependencies/simple/"
 ```
 
 This applies to all uv commands on the machine. DietPi's own config at
