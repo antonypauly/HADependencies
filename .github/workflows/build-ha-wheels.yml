@@ -392,9 +392,15 @@ jobs:
                 fi
 
                 if [ "$has_so" -eq 1 ]; then
-                  mods=$(cd "$pkgdir" && find . \( -name "*.cpython-*.so" -o -name "*.abi3.so" \) \
-                    -not -path "*.libs/*" -print \
-                    | sed -E "s#^\./##; s#\.(cpython-[^/]*|abi3)\.so\$##; s#/#.#g")
+                mods=""
+                while IFS= read -r -d "" so; do
+                  if nm -D --defined-only "$so" 2>/dev/null | grep -qE " [TW] PyInit_"; then
+                    rel=${so#"$pkgdir"/}
+                    mod=$(echo "$rel" | sed -E "s#\.(cpython-[^/]*|abi3)\.so\$##; s#/#.#g")
+                    mods="$mods $mod"
+                  fi
+                done < <(find "$pkgdir" \( -name "*.cpython-*.so" -o -name "*.abi3.so" \) \
+                          -not -path "*.libs/*" -print0)
 
                   if [ -z "$mods" ]; then
                     echo "WARNING: $(basename "$whl") has .so files but no importable extension modules found, skipping import check"
