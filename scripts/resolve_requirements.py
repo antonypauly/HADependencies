@@ -634,15 +634,11 @@ class Resolver:
 
     def resolve(self, requirement, source=None):
         """
-        Resolve one requirement. If it's compatible with a version
-        already resolved for this package name, it's folded into that
-        version's requirement (narrowing it, if needed). If it is NOT
-        compatible with any already-resolved version, it is resolved
-        independently and added as an ADDITIONAL version for this
-        package name, rather than discarded or forced to "win" over
-        the existing one.
+        Resolve one requirement.
 
-        Returns the chosen Version, or None on outright failure.
+        An already-resolved version is NEVER modified. If one satisfies
+        this requirement it is reused; otherwise this requirement is
+        resolved on its own and added as an additional version.
         """
         name = canonicalize_name(requirement.name)
 
@@ -659,44 +655,13 @@ class Resolver:
             self.add_review(str(requirement), "not found on PyPI")
             return None
 
+        # 1. Reuse an existing resolved version if it already satisfies this.
         with self.lock:
-            existing_group = list(self.resolved.get(name, []))
+            for entry in self.resolved.get(name, []):
+                if requirement.specifier.contains(entry.version, prereleases=True):
+                    return entry.version
 
-        # Try to fold this requirement into each already-resolved
-        # version for this name, in turn.
-        for entry in existing_group:
-            merged_requirement = self._merge_requirements(
-                entry.requirement, requirement
-            )
-
-            if merged_requirement is None:
-                continue
-
-            try:
-                chosen, version_str, reason_or_files = resolve_requirement(
-                    merged_requirement, self.constraints, files
-                )
-            except Exception:
-                continue
-
-            if chosen is None:
-                continue
-
-            with self.lock:
-                entry.requirement = merged_requirement
-
-                if version_str != entry.version_str:
-                    entry.version = chosen
-                    entry.version_str = version_str
-
-            # Compatible with (and folded into) an existing version --
-            # no new version needs to be added or expanded again
-            # unless the version actually changed.
-            self._maybe_expand(name, entry, requirement, source)
-            return entry.version
-
-        # Not compatible with any existing resolved version for this
-        # name (or there were none yet) -- resolve independently.
+        # 2. Otherwise resolve this requirement independently.
         try:
             chosen, version_str, reason_or_files = resolve_requirement(
                 requirement, self.constraints, files
@@ -706,35 +671,27 @@ class Resolver:
             return None
 
         if chosen is None:
-            reason = reason_or_files or "no compatible release found"
-
-            if existing_group:
-                other_versions = ", ".join(
-                    f"{name}=={e.version_str}" for e in existing_group
-                )
-                self.add_review(
-                    str(requirement),
-                    f"cannot satisfy this requirement even independently "
-                    f"of already-resolved version(s) {other_versions}; "
-                    f"{reason}",
-                )
-            else:
-                self.add_review(str(requirement), reason)
-
+            self.add_review(
+                str(requirement),
+                reason_or_files or "no compatible release found",
+            )
             return None
 
-        new_entry = ResolvedVersion(requirement, chosen, version_str)
-
+        # 3. Add it (check + append atomically, threads may race here).
         with self.lock:
-            self.resolved.setdefault(name, []).append(new_entry)
+            group = self.resolved.setdefault(name, [])
 
-        if existing_group:
-            other_versions = ", ".join(
-                f"{name}=={e.version_str}" for e in existing_group
-            )
+            if any(e.version_str == version_str for e in group):
+                return chosen
+
+            new_entry = ResolvedVersion(requirement, chosen, version_str)
+            others = ", ".join(f"{name}=={e.version_str}" for e in group)
+            group.append(new_entry)
+
+        if others:
             print(
                 f"Resolved {requirement} -> {name}=={version_str} "
-                f"(ALSO building {other_versions} for other dependents)"
+                f"(ALSO building {others} for other dependents)"
             )
         else:
             origin = f" (required by {source})" if source else ""
