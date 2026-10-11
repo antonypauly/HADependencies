@@ -139,7 +139,7 @@ jobs:
                   "$PY_VERSION" \
                   combined_requirements.txt \
                   to_build.txt \
-                  needs_review.txt
+                  needs_review.txt \
                   -c homeassistant/package_constraints.txt \                  
             echo "Packages needing a build (before skip-existing filter):"
             cat to_build.txt
