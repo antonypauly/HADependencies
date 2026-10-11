@@ -128,6 +128,23 @@ LEGACY_MANYLINUX = {
 # uv resolution
 # ---------------------------------------------------------------------------
 
+# Universal resolution normally has to succeed for EVERY platform (even
+# macOS/Windows), so a conflict that only exists there (e.g. a package with
+# no x86_64 macOS wheel) fails the whole run. Restricting uv's environments
+# to armv7l/Linux avoids that. `environments` is only read from a
+# pyproject.toml, so write a throwaway project and point uv at it.
+_ENV_DIR = tempfile.mkdtemp(prefix="uv-armv7-env-")
+Path(_ENV_DIR, "pyproject.toml").write_text(
+    f'''[project]
+name = "armv7-env"
+version = "0"
+requires-python = ">={args.py_version}"
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'armv7l'"]
+'''
+)
+
 
 def uv_compile(req_file, constraints):
     """Run `uv pip compile`. Returns (pins, error). pins = set of 'name==ver'."""
@@ -135,6 +152,7 @@ def uv_compile(req_file, constraints):
         "uv", "pip", "compile", str(req_file),
         "--python-version", args.py_version,
         "--universal",
+        "--project", _ENV_DIR,
         "--no-header", "--no-annotate", "--quiet",
     ]
     if constraints:
@@ -245,13 +263,36 @@ def fetch_files(name):
     raise err
 
 
-def file_version(filename):
+SDIST_EXTS = (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip")
+
+
+def file_version(filename, project):
+    """Version of a PyPI file, or None. `project` is the canonical name."""
     try:
         if filename.endswith(".whl"):
             return parse_wheel_filename(filename)[1]
-        return parse_sdist_filename(filename)[1]
     except Exception:
         return None
+
+    try:
+        return parse_sdist_filename(filename)[1]
+    except Exception:
+        pass
+
+    # Fallback for names like "pybbox-0.0.5-alpha.zip": try every "-"
+    # split until the prefix matches the project name.
+    base = filename
+    for ext in SDIST_EXTS:
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+            break
+    for i, ch in enumerate(base):
+        if ch == "-" and canonicalize_name(base[:i]) == project:
+            try:
+                return Version(base[i + 1 :])
+            except Exception:
+                return None
+    return None
 
 
 def interp_ok(tag):
@@ -302,7 +343,8 @@ def check(pin):
         return pin, "review", "not found on PyPI"
 
     ver = Version(version)
-    release = [f for f in files if file_version(f["filename"]) == ver]
+    key = canonicalize_name(name)
+    release = [f for f in files if file_version(f["filename"], key) == ver]
     if not release:
         return pin, "review", f"version {version} not on PyPI"
 
@@ -324,6 +366,13 @@ def check(pin):
 def main():
     review = []
     pins = resolve_all(args.requirements, args.constraints, review)
+
+    if not pins:
+        Path(args.build_out).write_text("")
+        Path(args.review_out).write_text(
+            "".join(f"{r}\n" for r in sorted(set(review)))
+        )
+        sys.exit("ERROR: uv resolved no packages; see " + args.review_out)
 
     print(f"Checking ARMv7 wheels for {len(pins)} package versions "
           f"(glibc <= {args.glibc})...", flush=True)
