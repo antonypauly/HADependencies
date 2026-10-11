@@ -138,9 +138,9 @@ jobs:
             python3 scripts/resolve_requirements.py \
                   "$PY_VERSION" \
                   combined_requirements.txt \
-                  homeassistant/package_constraints.txt \
                   to_build.txt \
                   needs_review.txt
+                  -c homeassistant/package_constraints.txt \                  
             echo "Packages needing a build (before skip-existing filter):"
             cat to_build.txt
             echo "Skipped/unresolved — check manually:"
