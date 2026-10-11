@@ -134,7 +134,7 @@ jobs:
           env:
             PY_VERSION: ${{ needs.config.outputs.py_version }}
           run: |
-            pip install --quiet packaging
+            pip install --quiet packaging uv
             python3 scripts/resolve_requirements.py \
                   "$PY_VERSION" \
                   combined_requirements.txt \
