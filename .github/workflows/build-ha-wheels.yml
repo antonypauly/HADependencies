@@ -400,8 +400,10 @@ jobs:
                     mod=$(echo "$rel" | sed -E "s#\.(cpython-[^/]*|abi3)\.so\$##; s#/#.#g")
                     mods="$mods $mod"
                   fi
-                done < <(find "$pkgdir" \( -name "*.cpython-*.so" -o -name "*.abi3.so" \) \
-                          -not -path "*.libs/*" -print0)
+                  done < <(find "$pkgdir" \( -name "*.cpython-*.so" -o -name "*.abi3.so" \) \
+                            -not -path "*.libs/*" \
+                            -not -path "*/tests/*" -not -path "*/test/*" \
+                            -print0)
 
                   if [ -z "$mods" ]; then
                     echo "WARNING: $(basename "$whl") has .so files but no importable extension modules found, skipping import check"
