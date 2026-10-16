@@ -13,10 +13,12 @@ Steps:
      markers are then evaluated against an armv7l/Linux/CPython
      environment, dropping pins that don't apply. uv's resolver handles
      extras, backtracking, requires-python and yanked releases.
-  2. If the combined resolution fails (conflicting pins), fall back to
-     resolving each direct requirement on its own and take the union, so
-     every version HA could ask for is covered.
-  3. For each resolved name==version, look at the files on PyPI and decide
+     If the combined resolution fails (conflicting pins, unsupported
+     Python version, ...) the script stops with uv's error and a non-zero
+     exit code. There is deliberately no fallback: HA's requirements are
+     meant to be installable together, so a failure here needs fixing, not
+     working around.
+  2. For each resolved name==version, look at the files on PyPI and decide
      whether a usable ARMv7 wheel exists (interpreter tag, platform tag,
      glibc version). If not, write name==version to to_build.txt.
 
@@ -161,8 +163,8 @@ def uv_compile(req_file, constraints):
     proc = subprocess.run(cmd, capture_output=True, text=True)
 
     if proc.returncode != 0:
-        tail = " | ".join(proc.stderr.strip().splitlines()[-6:])
-        return None, tail or f"uv exited with {proc.returncode}"
+        err = proc.stderr.strip()
+        return None, err or f"uv exited with {proc.returncode}"
 
     pins = set()
     for raw in proc.stdout.splitlines():
@@ -186,48 +188,14 @@ def uv_compile(req_file, constraints):
     return pins, None
 
 
-def read_direct_lines(path):
-    lines = []
-    for raw in Path(path).read_text().splitlines():
-        line = re.sub(r"\s+#.*$", "", raw.strip()).strip()
-        if line and not line.startswith("#"):
-            lines.append(line)
-    return lines
-
-
-def resolve_all(req_path, constraints, review):
-    print("Resolving combined requirements with uv...", flush=True)
-    pins, err = uv_compile(req_path, constraints)
-    if pins is not None:
-        print(f"  resolved {len(pins)} package versions")
-        return pins
-
-    print(f"  combined resolution failed: {err}")
-    print("  falling back to per-requirement resolution", flush=True)
-    review.append(f"# combined resolution failed, used per-requirement fallback: {err}")
-
-    lines = [l for l in read_direct_lines(req_path) if not l.startswith("-")]
-    all_pins = set()
-
-    def one(line):
-        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tmp:
-            tmp.write(line + "\n")
-            name = tmp.name
-        try:
-            return line, *uv_compile(name, constraints)
-        finally:
-            Path(name).unlink(missing_ok=True)
-
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        for fut in as_completed([pool.submit(one, l) for l in lines]):
-            line, got, err = fut.result()
-            if got is None:
-                review.append(f"{line}  # uv could not resolve: {err}")
-            else:
-                all_pins |= got
-
-    print(f"  resolved {len(all_pins)} package versions from {len(lines)} requirements")
-    return all_pins
+def fail_resolution(message):
+    """Write empty outputs plus the error to the review file, then exit 1."""
+    Path(args.build_out).write_text("")
+    Path(args.review_out).write_text(
+        "".join(f"# {line}\n" for line in message.splitlines())
+    )
+    print(f"ERROR: {message}", file=sys.stderr)
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -365,14 +333,14 @@ def check(pin):
 
 def main():
     review = []
-    pins = resolve_all(args.requirements, args.constraints, review)
 
+    print("Resolving combined requirements with uv...", flush=True)
+    pins, err = uv_compile(args.requirements, args.constraints)
+    if pins is None:
+        fail_resolution(f"uv could not resolve the combined requirements:\n{err}")
     if not pins:
-        Path(args.build_out).write_text("")
-        Path(args.review_out).write_text(
-            "".join(f"{r}\n" for r in sorted(set(review)))
-        )
-        sys.exit("ERROR: uv resolved no packages; see " + args.review_out)
+        fail_resolution("uv resolved no packages")
+    print(f"  resolved {len(pins)} package versions")
 
     print(f"Checking ARMv7 wheels for {len(pins)} package versions "
           f"(glibc <= {args.glibc})...", flush=True)
