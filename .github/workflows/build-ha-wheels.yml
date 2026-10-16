@@ -134,13 +134,14 @@ jobs:
           env:
             PY_VERSION: ${{ needs.config.outputs.py_version }}
           run: |
-            pip install --quiet packaging
+            pip install --quiet packaging uv
             python3 scripts/resolve_requirements.py \
                   "$PY_VERSION" \
                   combined_requirements.txt \
-                  homeassistant/package_constraints.txt \
                   to_build.txt \
-                  needs_review.txt
+                  needs_review.txt \
+                  -c homeassistant/package_constraints.txt \
+                  --glibc 2.36             
             echo "Packages needing a build (before skip-existing filter):"
             cat to_build.txt
             echo "Skipped/unresolved — check manually:"
@@ -399,8 +400,10 @@ jobs:
                     mod=$(echo "$rel" | sed -E "s#\.(cpython-[^/]*|abi3)\.so\$##; s#/#.#g")
                     mods="$mods $mod"
                   fi
-                done < <(find "$pkgdir" \( -name "*.cpython-*.so" -o -name "*.abi3.so" \) \
-                          -not -path "*.libs/*" -print0)
+                  done < <(find "$pkgdir" \( -name "*.cpython-*.so" -o -name "*.abi3.so" \) \
+                            -not -path "*.libs/*" \
+                            -not -path "*/tests/*" -not -path "*/test/*" \
+                            -print0)
 
                   if [ -z "$mods" ]; then
                     echo "WARNING: $(basename "$whl") has .so files but no importable extension modules found, skipping import check"

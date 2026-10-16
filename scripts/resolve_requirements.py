@@ -1,283 +1,296 @@
 #!/usr/bin/env python3
 """
+Decide which packages need an ARMv7 wheel built.
+
 usage:
-  resolve_requirements.py PY_VERSION combined_requirements.txt
-                       [constraints.txt] to_build.txt needs_review.txt
+  resolve_requirements.py PY_VERSION combined_requirements.txt \
+      to_build.txt needs_review.txt [-c constraints.txt] [options]
 
-Resolves direct and transitive dependencies for the target Python version,
-then determines which exact package versions need an ARMv7 wheel built.
+Steps:
+  1. Resolve the full dependency tree with `uv pip compile --universal`.
+     uv has no ARMv7 target for --python-platform, so it resolves for all
+     platforms and annotates each pin with its environment marker. The
+     markers are then evaluated against an armv7l/Linux/CPython
+     environment, dropping pins that don't apply. uv's resolver handles
+     extras, backtracking, requires-python and yanked releases.
+     If the combined resolution fails (conflicting pins, unsupported
+     Python version, ...) the script stops with uv's error and a non-zero
+     exit code. There is deliberately no fallback: HA's requirements are
+     meant to be installable together, so a failure here needs fixing, not
+     working around.
+  2. For each resolved name==version, look at the files on PyPI and decide
+     whether a usable ARMv7 wheel exists (interpreter tag, platform tag,
+     glibc version). If not, write name==version to to_build.txt.
 
-Arguments:
-  PY_VERSION
-      Target CPython version, e.g. 3.14
-
-  combined_requirements.txt
-      Direct requirements extracted from Home Assistant requirements files.
-
-  constraints.txt
-      Optional Home Assistant package constraints file.
-
-  to_build.txt
-      Output file containing exact package==version requirements that need
-      an ARMv7 wheel.
-
-  needs_review.txt
-      Output file containing requirements that could not be resolved safely.
-
-For every dependency:
-  1. Evaluate environment markers for Linux/armv7l/CPython.
-  2. Apply Home Assistant constraints where present.
-  3. Resolve an exact version:
-       - name==X -> X exactly
-       - ranges -> highest compatible PyPI release
-  4. Read Requires-Dist from that exact release.
-  5. Recursively resolve its dependencies.
-  6. Check whether a usable ARMv7/Python wheel exists.
-  7. If not, write name==version to to_build.txt.
+Requires: uv on PATH, and the `packaging` library.
 """
 
+import argparse
 import gzip
-import html
 import json
 import re
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from packaging.version import InvalidVersion, Version
-import threading
+from pathlib import Path
 
 from packaging.requirements import InvalidRequirement, Requirement
-from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import (
     canonicalize_name,
     parse_sdist_filename,
     parse_wheel_filename,
 )
-from packaging.version import InvalidVersion, Version
-
+from packaging.version import Version
 
 # ---------------------------------------------------------------------------
 # Arguments
 # ---------------------------------------------------------------------------
 
-if len(sys.argv) == 5:
-    # Backwards-compatible form:
-    # resolve_requirements.py PY_VERSION requirements build_out review_out
-    py_version, reqs_path, build_out, review_out = sys.argv[1:5]
-    constraints_path = None
-elif len(sys.argv) == 6:
-    # New form:
-    # resolve_requirements.py PY_VERSION requirements constraints build_out review_out
-    py_version, reqs_path, constraints_path, build_out, review_out = sys.argv[
-        1:6
-    ]
-else:
-    print(
-        "usage: resolve_requirements.py "
-        "PY_VERSION combined_requirements.txt "
-        "[constraints.txt] to_build.txt needs_review.txt",
-        file=sys.stderr,
-    )
-    sys.exit(2)
+parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+parser.add_argument("py_version", help="Target CPython version, e.g. 3.14")
+parser.add_argument("requirements", help="Direct requirements file")
+parser.add_argument("build_out", help="Output: name==version to build")
+parser.add_argument("review_out", help="Output: items needing review")
+parser.add_argument(
+    "-c", "--constraints", help="Constraints file (HA package_constraints.txt)"
+)
+parser.add_argument(
+    "--glibc",
+    default=None,
+    help="glibc version of the target OS; manylinux wheels needing a newer "
+    "glibc are treated as unusable. Default: detected from the OS the "
+    "script runs on, so run it inside the same image you build wheels in "
+    "(e.g. Debian 12 = 2.36).",
+)
+parser.add_argument(
+    "--workers", type=int, default=8, help="Parallel workers (default: 8)"
+)
+args = parser.parse_args()
 
-
-PY = Version(py_version)
+PY = Version(args.py_version)
 MINOR = PY.minor
-CPTAG = "cp" + py_version.replace(".", "")
+CPTAG = "cp" + args.py_version.replace(".", "")
+
+
+def detect_glibc():
+    """glibc version of the OS this script runs on, e.g. '2.36'."""
+    try:
+        import os
+
+        name, version = os.confstr("CS_GNU_LIBC_VERSION").split()
+        if name == "glibc":
+            return version
+    except (AttributeError, ValueError, OSError):
+        pass
+    return None
+
+
+if args.glibc is None:
+    args.glibc = detect_glibc()
+    if args.glibc is None:
+        sys.exit("Could not detect glibc (non-glibc OS?); pass --glibc X.Y")
+    print(f"Detected glibc {args.glibc} from the OS")
+
+GLIBC = tuple(int(x) for x in args.glibc.split(".")[:2])
 
 MARKER_ENV = {
-    "python_version": py_version,
-    "python_full_version": f"{py_version}.0",
-    "implementation_version": f"{py_version}.0",
+    "python_version": args.py_version,
+    "python_full_version": f"{args.py_version}.0",
     "implementation_name": "cpython",
+    "implementation_version": f"{args.py_version}.0",
     "platform_python_implementation": "CPython",
     "platform_machine": "armv7l",
     "platform_system": "Linux",
+    "platform_release": "",
+    "platform_version": "",
     "sys_platform": "linux",
     "os_name": "posix",
+    "extra": "",
 }
 
 SIMPLE_URL = "https://pypi.org/simple/{}/"
-JSON_URL = "https://pypi.org/pypi/{}/{}/json"
-
 HEADERS = {
     "Accept": "application/vnd.pypi.simple.v1+json",
     "Accept-Encoding": "gzip",
-    "User-Agent": "ha-wheels-build/1.0",
+    "User-Agent": "ha-wheels-build/2.0",
 }
 
-JSON_HEADERS = {
-    "Accept": "application/json",
-    "User-Agent": "ha-wheels-build/1.0",
+# manylinux legacy aliases -> glibc version
+LEGACY_MANYLINUX = {
+    "manylinux1": (2, 5),
+    "manylinux2010": (2, 12),
+    "manylinux2014": (2, 17),
 }
+
+# ---------------------------------------------------------------------------
+# uv resolution
+# ---------------------------------------------------------------------------
+
+# Universal resolution normally has to succeed for EVERY platform (even
+# macOS/Windows), so a conflict that only exists there (e.g. a package with
+# no x86_64 macOS wheel) fails the whole run. Restricting uv's environments
+# to armv7l/Linux avoids that. `environments` is only read from a
+# pyproject.toml, so write a throwaway project and point uv at it.
+_ENV_DIR = tempfile.mkdtemp(prefix="uv-armv7-env-")
+Path(_ENV_DIR, "pyproject.toml").write_text(
+    f'''[project]
+name = "armv7-env"
+version = "0"
+requires-python = ">={args.py_version}"
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'armv7l'"]
+'''
+)
+
+
+def uv_compile(req_file, constraints):
+    """Run `uv pip compile`. Returns (pins, error). pins = set of 'name==ver'."""
+    cmd = [
+        "uv", "pip", "compile", str(req_file),
+        "--python-version", args.py_version,
+        "--universal",
+        "--project", _ENV_DIR,
+        "--no-header", "--no-annotate", "--quiet",
+    ]
+    if constraints:
+        cmd += ["-c", constraints]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+
+    if proc.returncode != 0:
+        err = proc.stderr.strip()
+        return None, err or f"uv exited with {proc.returncode}"
+
+    pins = set()
+    for raw in proc.stdout.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith("-"):
+            continue
+        try:
+            req = Requirement(line)
+        except InvalidRequirement:
+            continue
+        specs = list(req.specifier)
+        if req.url or len(specs) != 1 or specs[0].operator != "==":
+            continue
+        if req.marker is not None:
+            try:
+                if not req.marker.evaluate(MARKER_ENV):
+                    continue  # pin does not apply to armv7l/Linux
+            except Exception:
+                pass  # can't evaluate: keep it rather than drop it
+        pins.add(f"{canonicalize_name(req.name)}=={specs[0].version}")
+    return pins, None
+
+
+def fail_resolution(message):
+    """Write empty outputs plus the error to the review file, then exit 1."""
+    Path(args.build_out).write_text("")
+    Path(args.review_out).write_text(
+        "".join(f"# {line}\n" for line in message.splitlines())
+    )
+    print(f"ERROR: {message}", file=sys.stderr)
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
-# HTTP helpers
+# PyPI wheel check
 # ---------------------------------------------------------------------------
 
-def http_json(url, headers):
-    """Fetch JSON with retries."""
+_cache = {}
+
+
+def fetch_files(name):
+    key = canonicalize_name(name)
+    if key in _cache:
+        return _cache[key]
+
     err = None
-
     for attempt in range(3):
         try:
-            req = urllib.request.Request(url, headers=headers)
-
-            with urllib.request.urlopen(req, timeout=30) as response:
-                data = response.read()
-
-                if response.headers.get("Content-Encoding") == "gzip":
+            req = urllib.request.Request(SIMPLE_URL.format(key), headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+                if resp.headers.get("Content-Encoding") == "gzip":
                     data = gzip.decompress(data)
-
-                return json.loads(data)
-
+                _cache[key] = json.loads(data)["files"]
+                return _cache[key]
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
+                _cache[key] = None
                 return None
             err = exc
-
         except Exception as exc:
             err = exc
-
         time.sleep(2 * (attempt + 1))
-
     raise err
 
 
-# ---------------------------------------------------------------------------
-# PyPI access
-# ---------------------------------------------------------------------------
-
-_file_cache = {}
-_metadata_cache = {}
+SDIST_EXTS = (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip")
 
 
-def fetch(name):
-    """
-    Return the list of files for a PyPI project.
-
-    None means the project does not exist on PyPI.
-    """
-    key = canonicalize_name(name)
-
-    if key in _file_cache:
-        return _file_cache[key]
-
-    url = SIMPLE_URL.format(key)
-    data = http_json(url, HEADERS)
-
-    if data is None:
-        _file_cache[key] = None
+def file_version(filename, project):
+    """Version of a PyPI file, or None. `project` is the canonical name."""
+    try:
+        if filename.endswith(".whl"):
+            return parse_wheel_filename(filename)[1]
+    except Exception:
         return None
 
-    files = data["files"]
-    _file_cache[key] = files
-    return files
-
-
-def safe_fetch(name):
     try:
-        return fetch(name)
-    except Exception as exc:
-        return exc
+        return parse_sdist_filename(filename)[1]
+    except Exception:
+        pass
 
+    # Fallback for names like "pybbox-0.0.5-alpha.zip": try every "-"
+    # split until the prefix matches the project name.
+    base = filename
+    for ext in SDIST_EXTS:
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+            break
+    for i, ch in enumerate(base):
+        if ch == "-" and canonicalize_name(base[:i]) == project:
+            try:
+                return Version(base[i + 1 :])
+            except Exception:
+                return None
+    return None
 
-def fetch_release_metadata(name, version):
-    """
-    Fetch package metadata for one exact PyPI release.
-
-    This is where Requires-Dist is obtained.
-    """
-    key = (canonicalize_name(name), str(version))
-
-    if key in _metadata_cache:
-        return _metadata_cache[key]
-
-    url = JSON_URL.format(key[0], key[1])
-    data = http_json(url, JSON_HEADERS)
-
-    if data is None:
-        _metadata_cache[key] = None
-        return None
-
-    metadata = data.get("info", {})
-    _metadata_cache[key] = metadata
-    return metadata
-
-
-def safe_fetch_release_metadata(name, version):
-    try:
-        return fetch_release_metadata(name, version)
-    except Exception as exc:
-        return exc
-
-
-# ---------------------------------------------------------------------------
-# Version/file helpers
-# ---------------------------------------------------------------------------
-
-def versions_of(files):
-    """
-    Return:
-
-        {Version: [file dicts]}
-
-    based on PyPI filenames.
-    """
-    out = {}
-
-    for item in files:
-        filename = item["filename"]
-
-        try:
-            if filename.endswith(".whl"):
-                version = parse_wheel_filename(filename)[1]
-            else:
-                version = parse_sdist_filename(filename)[1]
-        except Exception:
-            continue
-
-        out.setdefault(version, []).append(item)
-
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Compatibility
-# ---------------------------------------------------------------------------
 
 def interp_ok(tag):
-    interpreter = tag.interpreter
-
-    if interpreter == CPTAG:
-        # Do not use free-threaded cp314t etc.
-        return not tag.abi.endswith("t")
-
-    match = re.fullmatch(r"py3(\d*)", interpreter)
-
-    if match:
-        # py3 / py3X universal Python wheels.
-        return not match.group(1) or int(match.group(1)) <= MINOR
-
-    match = re.fullmatch(r"cp3(\d+)", interpreter)
-
-    if match:
-        # CPython abi3 wheels.
-        return tag.abi == "abi3" and int(match.group(1)) <= MINOR
-
+    interp = tag.interpreter
+    if interp == CPTAG:
+        return not tag.abi.endswith("t")  # no free-threaded builds
+    m = re.fullmatch(r"py3(\d*)", interp)
+    if m:
+        return not m.group(1) or int(m.group(1)) <= MINOR
+    m = re.fullmatch(r"cp3(\d+)", interp)
+    if m:
+        return tag.abi == "abi3" and int(m.group(1)) <= MINOR
     return False
 
 
 def platform_ok(tag):
-    platform = tag.platform
+    plat = tag.platform
+    if plat == "any":
+        return True
+    if "armv7l" not in plat or "musllinux" in plat:
+        return False
 
-    return (
-        platform == "any"
-        or ("armv7l" in platform and "musllinux" not in platform)
-    )
+    # glibc check for manylinux tags
+    m = re.match(r"manylinux_(\d+)_(\d+)_", plat)
+    if m:
+        return (int(m.group(1)), int(m.group(2))) <= GLIBC
+    for legacy, glibc in LEGACY_MANYLINUX.items():
+        if plat.startswith(legacy + "_"):
+            return glibc <= GLIBC
+    return True  # plain linux_armv7l
 
 
 def wheel_usable(filename):
@@ -285,645 +298,85 @@ def wheel_usable(filename):
         tags = parse_wheel_filename(filename)[3]
     except Exception:
         return False
-
-    return any(
-        interp_ok(tag) and platform_ok(tag)
-        for tag in tags
-    )
+    return any(interp_ok(t) and platform_ok(t) for t in tags)
 
 
-def release_eligible(files):
-    """
-    Return True if the release has at least one non-yanked file whose
-    requires-python permits the target Python.
-    """
-    for item in files:
-        if item.get("yanked"):
-            continue
+def check(pin):
+    name, version = pin.split("==")
+    try:
+        files = fetch_files(name)
+    except Exception as exc:
+        return pin, "review", f"PyPI lookup failed: {exc}"
+    if files is None:
+        return pin, "review", "not found on PyPI"
 
-        requires_python = item.get("requires-python")
+    ver = Version(version)
+    key = canonicalize_name(name)
+    release = [f for f in files if file_version(f["filename"], key) == ver]
+    if not release:
+        return pin, "review", f"version {version} not on PyPI"
 
-        if requires_python:
-            try:
-                if not SpecifierSet(
-                    html.unescape(requires_python)
-                ).contains(PY, prereleases=True):
-                    continue
-            except InvalidSpecifier:
-                pass
-
-        return True
-
-    return False
-
-
-def exact_pin(specifier):
-    """
-    Return X for exactly:
-
-        ==X
-
-    but not:
-
-        ==X.*
-    """
-    specs = list(specifier)
-
-    if (
-        len(specs) == 1
-        and specs[0].operator == "=="
-        and not specs[0].version.endswith(".*")
+    if any(
+        f["filename"].endswith(".whl") and wheel_usable(f["filename"])
+        for f in release
     ):
-        return specs[0].version
+        return pin, "usable", None
 
-    return None
+    has_wheels = any(f["filename"].endswith(".whl") for f in release)
+    return pin, "build", "wheels exist but none usable" if has_wheels else "sdist only"
 
-
-# ---------------------------------------------------------------------------
-# Requirement parsing
-# ---------------------------------------------------------------------------
-
-def marker_applies(req):
-    """
-    Evaluate a requirement marker against the ARMv7/CPython target.
-    """
-    if req.marker is None:
-        return True
-
-    try:
-        return req.marker.evaluate(MARKER_ENV)
-    except Exception:
-        # Preserve the old behavior: if we cannot evaluate a marker,
-        # don't silently discard the dependency.
-        return True
-
-
-def parse_requirement_line(line):
-    """
-    Parse one requirement line.
-
-    Returns:
-        Requirement
-        None, problem
-    """
-    line = re.sub(r"\s+#.*$", "", line.strip()).strip()
-
-    if not line:
-        return None, None
-
-    if line.startswith("-"):
-        return None, "option line, not a requirement"
-
-    try:
-        req = Requirement(line)
-    except InvalidRequirement as exc:
-        return None, f"cannot parse: {exc}"
-
-    if req.url:
-        return None, "direct URL requirement"
-
-    if not marker_applies(req):
-        return None, "marker does not apply to target"
-
-    return req, None
-
-
-def parse_requirements(path):
-    """
-    Parse the direct requirements file.
-
-    Returns:
-        [(raw_line, Requirement | None, problem | None)]
-    """
-    items = []
-
-    with open(path) as handle:
-        for raw in handle:
-            line = raw.strip()
-
-            if not line:
-                continue
-
-            req, problem = parse_requirement_line(line)
-
-            if req is None and problem == "marker does not apply to target":
-                continue
-
-            items.append((line, req, problem))
-
-    return items
-
-
-def parse_constraints(path):
-    """
-    Parse Home Assistant's constraints file.
-
-    Constraints are grouped by canonical package name.
-
-    Multiple constraints for the same package are combined.
-    """
-    constraints = {}
-
-    if not path:
-        return constraints
-
-    with open(path) as handle:
-        for raw in handle:
-            line = re.sub(r"\s+#.*$", "", raw.strip()).strip()
-
-            if not line:
-                continue
-
-            if line.startswith("-"):
-                continue
-
-            try:
-                req = Requirement(line)
-            except InvalidRequirement:
-                continue
-
-            if req.url:
-                continue
-
-            if not marker_applies(req):
-                continue
-
-            name = canonicalize_name(req.name)
-
-            constraints.setdefault(name, []).append(req.specifier)
-
-    return constraints
-
-
-def combined_specifier(requirement, constraints):
-    """
-    Combine a requirement's specifier with all matching constraints.
-    """
-    parts = []
-
-    requirement_spec = str(requirement.specifier)
-
-    if requirement_spec:
-        parts.append(requirement_spec)
-
-    name = canonicalize_name(requirement.name)
-
-    for constraint in constraints.get(name, []):
-        value = str(constraint)
-
-        if value:
-            parts.append(value)
-
-    if not parts:
-        return SpecifierSet()
-
-    try:
-        return SpecifierSet(",".join(parts))
-    except InvalidSpecifier as exc:
-        raise ValueError(
-            f"invalid combined specifier for {requirement.name}: "
-            f"{','.join(parts)} ({exc})"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Version resolution
-# ---------------------------------------------------------------------------
-
-def resolve_requirement(requirement, constraints, files=None):
-    """
-    Resolve one Requirement to:
-
-        (chosen Version, version string, files)
-
-    or:
-
-        (None, None, reason)
-    """
-    name = canonicalize_name(requirement.name)
-
-    if files is None:
-        files = fetch(name)
-
-    if isinstance(files, Exception):
-        return None, None, f"PyPI lookup failed: {files}"
-
-    if files is None:
-        return None, None, "not found on PyPI"
-
-    if any(spec.operator == "===" for spec in requirement.specifier):
-        return None, None, "arbitrary equality (===) not supported"
-
-    try:
-        specifier = combined_specifier(requirement, constraints)
-    except ValueError as exc:
-        return None, None, str(exc)
-
-    versions = versions_of(files)
-
-    pin = exact_pin(requirement.specifier)
-
-    # ------------------------------------------------------------------
-    # Exact direct pin.
-    #
-    # Keep exact HA requirements exact. A constraint may narrow it, but
-    # must not silently replace it with another version.
-    # ------------------------------------------------------------------
-    if pin is not None:
-        try:
-            chosen = Version(pin)
-        except InvalidVersion:
-            return None, None, "invalid pinned version"
-
-        if chosen not in versions:
-            return None, None, f"version {pin} not on PyPI"
-
-        if not specifier.contains(chosen, prereleases=True):
-            return (
-                None,
-                None,
-                f"pinned version {pin} conflicts with constraints",
-            )
-
-        return chosen, pin, versions[chosen]
-
-    # ------------------------------------------------------------------
-    # Ranges / unconstrained requirements.
-    # ------------------------------------------------------------------
-    candidates = [
-        version
-        for version, release_files in versions.items()
-        if release_eligible(release_files)
-    ]
-
-    matching = list(specifier.filter(candidates))
-
-    if not matching:
-        return (
-            None,
-            None,
-            f"no release satisfies the specifier for Python {py_version}",
-        )
-
-    chosen = max(matching)
-    version_str = str(chosen)
-
-    return chosen, version_str, versions[chosen]
-
-
-
-# ---------------------------------------------------------------------------
-# Dependency traversal
-# ---------------------------------------------------------------------------
-
-class ResolvedVersion:
-    __slots__ = ("requirement", "version", "version_str")
-
-    def __init__(self, requirement, version, version_str):
-        self.requirement = requirement
-        self.version = version
-        self.version_str = version_str
-
-
-class Resolver:
-    def __init__(self, constraints):
-        self.constraints = constraints
-
-        # canonical package name -> list[ResolvedVersion]
-        #
-        # Usually one entry. More than one means two or more dependents
-        # want versions of this package that cannot be reconciled into
-        # a single specifier (e.g. one exact pin vs. an incompatible
-        # range) -- every such version gets built, since HA installs
-        # each integration's requirements independently and may need
-        # any of them depending on which integration is being set up.
-        self.resolved = {}
-
-        # (name, version_str) -> True, once its Requires-Dist has been
-        # walked, so we never expand the same release twice.
-        self.expanded = set()
-
-        self.review = []
-        self.lock = threading.RLock()
-
-    def add_review(self, requirement, reason):
-        self.review.append(
-            f"{requirement}  # {reason or 'unresolvable (no reason reported)'}"
-        )
-
-    @staticmethod
-    def _merge_requirements(req_a, req_b):
-        """
-        Combine two Requirement objects for the same canonical package
-        name into one synthetic Requirement whose specifier is the
-        intersection (AND) of both. Returns None only if the combined
-        line is not syntactically parseable.
-        """
-        name = req_a.name
-        spec_parts = [str(req_a.specifier), str(req_b.specifier)]
-        spec_parts = [part for part in spec_parts if part]
-        merged_spec = ",".join(spec_parts)
-
-        extras = sorted(set(req_a.extras) | set(req_b.extras))
-        extras_str = f"[{','.join(extras)}]" if extras else ""
-
-        try:
-            return Requirement(f"{name}{extras_str}{merged_spec}")
-        except InvalidRequirement:
-            return None
-
-    def resolve(self, requirement, source=None):
-        """
-        Resolve one requirement.
-
-        An already-resolved version is NEVER modified. If one satisfies
-        this requirement it is reused; otherwise this requirement is
-        resolved on its own and added as an additional version.
-        """
-        name = canonicalize_name(requirement.name)
-
-        if not marker_applies(requirement):
-            return None
-
-        files = fetch(name)
-
-        if isinstance(files, Exception):
-            self.add_review(str(requirement), f"PyPI lookup failed: {files}")
-            return None
-
-        if files is None:
-            self.add_review(str(requirement), "not found on PyPI")
-            return None
-
-        # 1. Reuse an existing resolved version if it already satisfies this.
-        with self.lock:
-            for entry in self.resolved.get(name, []):
-                if requirement.specifier.contains(entry.version, prereleases=True):
-                    return entry.version
-
-        # 2. Otherwise resolve this requirement independently.
-        try:
-            chosen, version_str, reason_or_files = resolve_requirement(
-                requirement, self.constraints, files
-            )
-        except Exception as exc:
-            self.add_review(str(requirement), f"resolution error: {exc}")
-            return None
-
-        if chosen is None:
-            self.add_review(
-                str(requirement),
-                reason_or_files or "no compatible release found",
-            )
-            return None
-
-        # 3. Add it (check + append atomically, threads may race here).
-        with self.lock:
-            group = self.resolved.setdefault(name, [])
-
-            if any(e.version_str == version_str for e in group):
-                return chosen
-
-            new_entry = ResolvedVersion(requirement, chosen, version_str)
-            others = ", ".join(f"{name}=={e.version_str}" for e in group)
-            group.append(new_entry)
-
-        if others:
-            print(
-                f"Resolved {requirement} -> {name}=={version_str} "
-                f"(ALSO building {others} for other dependents)"
-            )
-        else:
-            origin = f" (required by {source})" if source else ""
-            print(f"Resolved {requirement}{origin} -> {name}=={version_str}")
-
-        self._maybe_expand(name, new_entry, requirement, source)
-        return chosen
-
-    def _maybe_expand(self, name, entry, requirement, source):
-        """Walk Requires-Dist for entry's release, once per release."""
-        key = (name, entry.version_str)
-
-        with self.lock:
-            if key in self.expanded:
-                return
-            self.expanded.add(key)
-
-        metadata = fetch_release_metadata(name, entry.version_str)
-
-        if isinstance(metadata, Exception):
-            self.add_review(
-                f"{name}=={entry.version_str}",
-                f"metadata lookup failed: {metadata}",
-            )
-            return
-
-        if metadata is None:
-            self.add_review(
-                f"{name}=={entry.version_str}",
-                "release metadata not found on PyPI",
-            )
-            return
-
-        for dependency_line in metadata.get("requires_dist") or []:
-            try:
-                dependency = Requirement(dependency_line)
-            except InvalidRequirement as exc:
-                self.add_review(
-                    f"{name}=={entry.version_str} -> {dependency_line}",
-                    f"cannot parse dependency: {exc}",
-                )
-                continue
-
-            if dependency.url:
-                self.add_review(
-                    f"{name}=={entry.version_str} -> {dependency_line}",
-                    "direct URL dependency",
-                )
-                continue
-
-            if not marker_applies(dependency):
-                continue
-
-            self.resolve(dependency, source=f"{name}=={entry.version_str}")
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    items = parse_requirements(reqs_path)
-    constraints = parse_constraints(constraints_path)
 
-    direct_requirements = []
+def main():
     review = []
 
-    for line, req, problem in items:
-        if problem:
-            review.append(f"{line}  # {problem}")
-            continue
+    print("Resolving combined requirements with uv...", flush=True)
+    pins, err = uv_compile(args.requirements, args.constraints)
+    if pins is None:
+        fail_resolution(f"uv could not resolve the combined requirements:\n{err}")
+    if not pins:
+        fail_resolution("uv resolved no packages")
+    print(f"  resolved {len(pins)} package versions")
 
-        direct_requirements.append(req)
+    print(f"Checking ARMv7 wheels for {len(pins)} package versions "
+          f"(glibc <= {args.glibc})...", flush=True)
 
-    names = sorted(
-        {
-            canonicalize_name(req.name)
-            for req in direct_requirements
-        }
-    )
-
-    print(
-        f"{len(direct_requirements)} direct requirements, "
-        f"{len(names)} distinct packages"
-    )
-
-    if constraints_path:
-        print(
-            f"Loaded constraints from {constraints_path}: "
-            f"{len(constraints)} packages"
-        )
-
-    resolver = Resolver(constraints)
-
-    # Resolve direct dependencies concurrently at the top level.
-    #
-    # Recursive dependency expansion itself remains deterministic.
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {
-            pool.submit(resolver.resolve, req): req
-            for req in direct_requirements
-        }
-
-        for future in as_completed(futures):
-            req = futures[future]
-
-            try:
-                future.result()
-            except Exception as exc:
-                resolver.add_review(
-                    str(req),
-                    f"unexpected resolver error: {exc}",
-                )
-
-    review.extend(resolver.review)
-
-    # ------------------------------------------------------------------
-    # Now check every resolved package for a usable ARMv7 wheel.
-    # ------------------------------------------------------------------
-
-    to_build = set()
-    skipped = 0
-
-    resolved_items = sorted(
-        (
-            (name, entry.version)
-            for name, entries in resolver.resolved.items()
-            for entry in entries
-        ),
-        key=lambda item: (item[0], str(item[1])),
-    )
-
-    print(
-        f"Checking ARMv7 wheels for "
-        f"{len(resolved_items)} resolved package versions "
-        f"({len(resolver.resolved)} distinct package names)..."
-    )
-
-    def check_wheel(name, version):
-        files = fetch(name)
-
-        if isinstance(files, Exception):
-            return (
-                name,
-                version,
-                "review",
-                f"PyPI lookup failed: {files}",
-            )
-
-        if files is None:
-            return (
-                name,
-                version,
-                "review",
-                "not found on PyPI",
-            )
-
-        versions = versions_of(files)
-
-        if version not in versions:
-            return (
-                name,
-                version,
-                "review",
-                f"version {version} not on PyPI",
-            )
-
-        release_files = versions[version]
-
-        usable = any(
-            item["filename"].endswith(".whl")
-            and wheel_usable(item["filename"])
-            for item in release_files
-        )
-
-        if usable:
-            return name, version, "usable", None
-
-        return name, version, "build", None
-
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = [
-            pool.submit(check_wheel, name, version)
-            for name, version in resolved_items
-        ]
-
-        for future in as_completed(futures):
-            name, version, result, reason = future.result()
-
-            requirement = f"{name}=={version}"
-
+    to_build, usable = {}, 0
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        for fut in as_completed([pool.submit(check, p) for p in sorted(pins)]):
+            pin, result, note = fut.result()
             if result == "usable":
-                skipped += 1
-
+                usable += 1
             elif result == "build":
-                to_build.add(requirement)
-
+                to_build[pin] = note
             else:
-                review.append(
-                    f"{requirement}  # {reason}"
-                )
+                review.append(f"{pin}  # {note}")
 
-    # ------------------------------------------------------------------
-    # Write outputs.
-    # ------------------------------------------------------------------
+    Path(args.build_out).write_text(
+        "".join(f"{p}\n" for p in sorted(to_build))
+    )
+    Path(args.review_out).write_text(
+        "".join(f"{r}\n" for r in sorted(set(review)))
+    )
 
-    with open(build_out, "w") as handle:
-        for requirement in sorted(to_build):
-            handle.write(f"{requirement}\n")
-
-    with open(review_out, "w") as handle:
-        for item in sorted(set(review)):
-            handle.write(f"{item}\n")
-
-    print()
-    print("Resolution complete")
-    print("-------------------")
-    print(f"Resolved packages:       {len(resolver.resolved)}")
-    print(f"Usable ARMv7 wheels:     {skipped}")
-    print(f"Wheels to build:         {len(to_build)}")
-    print(f"Needs review:            {len(set(review))}")
+    print("\nResolution complete\n-------------------")
+    print(f"Resolved package versions: {len(pins)}")
+    print(f"Usable ARMv7 wheels:       {usable}")
+    print(f"Wheels to build:           {len(to_build)}")
+    print(f"Needs review:              {len(set(review))}")
 
     if to_build:
-        print()
-        print("Packages requiring ARMv7 wheels:")
-        for requirement in sorted(to_build):
-            print(f"  {requirement}")
-
+        print("\nPackages requiring ARMv7 wheels:")
+        for p in sorted(to_build):
+            print(f"  {p}  ({to_build[p]})")
     if review:
-        print()
-        print("Packages requiring review:")
-        for item in sorted(set(review)):
-            print(f"  {item}")
+        print("\nPackages requiring review:")
+        for r in sorted(set(review)):
+            print(f"  {r}")
 
 
 if __name__ == "__main__":
