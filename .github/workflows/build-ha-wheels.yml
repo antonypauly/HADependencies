@@ -61,10 +61,10 @@ jobs:
           with open("ha-pyproject.toml", "rb") as f:
               spec = tomllib.load(f)["project"]["requires-python"]   # e.g. ">=3.13.2"
  
-          m = re.search(r">=\s*(\d+)\.(\d+)", spec)
+          m = re.search(r">=\s*(\d+)\.(\d+)(?:\.(\d+))?", spec)
           if not m:
               sys.exit(f"Could not parse requires-python: {spec!r}")
-          print(f"{m.group(1)}.{m.group(2)}")
+          print(f"{m.group(1)}.{m.group(2)}.{m.group(3) or '0'}")
           PY
           )
  
@@ -72,9 +72,11 @@ jobs:
           # (use it when the Python on the Pi is newer than HA's minimum)
           PY_OVERRIDE=$(yq '.python_version // ""' build-config.yaml)
           PY_VERSION="${PY_OVERRIDE:-$MIN_PY}"
-          # The cp-tag logic in detect/build (tr -d '.') assumes major.minor
-          PY_VERSION=$(echo "$PY_VERSION" | cut -d. -f1,2)
- 
+          if [[ ! "$PY_VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::python_version must be major.minor or major.minor.patch, got ${PY_VERSION}"
+            exit 1
+          fi
+
           echo "HA ${HA_VERSION} requires Python >= ${MIN_PY}; building for ${PY_VERSION}"
  
           # An override must not be lower than HA's minimum
@@ -158,7 +160,7 @@ jobs:
               exit 0
             fi
 
-            CPTAG="cp$(echo "${{ needs.config.outputs.py_version }}" | tr -d '.')"
+            CPTAG="cp$(echo "${{ needs.config.outputs.py_version }}" | cut -d. -f1,2 | tr -d '.')"
             pip install --quiet packaging
             bash scripts/list_wheels.sh "$GITHUB_REPOSITORY" all_wheels.tsv
             python3 scripts/filter_built.py "$CPTAG" all_wheels.tsv to_build.txt > to_build_filtered.txt
@@ -268,7 +270,7 @@ jobs:
             ${{ needs.build-image.outputs.image }} \
             bash -c "
               PKG='${{ matrix.package }}' &&
-              CPTAG=\"cp\$(echo \\\"\$PY_VERSION\\\" | tr -d '.')\" &&
+              CPTAG=\"cp\$(echo \\\"\$PY_VERSION\\\" | cut -d. -f1,2 | tr -d '.')\" &&
               case \"\$PKG\" in
                 uv==*)
                   # uv is a Rust binary; there's no Rust toolchain here

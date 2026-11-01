@@ -51,7 +51,9 @@ from packaging.version import Version
 # ---------------------------------------------------------------------------
 
 parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-parser.add_argument("py_version", help="Target CPython version, e.g. 3.14")
+parser.add_argument(
+    "py_version", help="Target CPython version, e.g. 3.14 or 3.14.2"
+)
 parser.add_argument("requirements", help="Direct requirements file")
 parser.add_argument("build_out", help="Output: name==version to build")
 parser.add_argument("review_out", help="Output: items needing review")
@@ -73,7 +75,9 @@ args = parser.parse_args()
 
 PY = Version(args.py_version)
 MINOR = PY.minor
-CPTAG = "cp" + args.py_version.replace(".", "")
+PY_MAJOR_MINOR = f"{PY.major}.{PY.minor}"
+PY_FULL_VERSION = ".".join(str(part) for part in (*PY.release, 0)[:3])
+CPTAG = "cp" + PY_MAJOR_MINOR.replace(".", "")
 
 
 def detect_glibc():
@@ -98,10 +102,10 @@ if args.glibc is None:
 GLIBC = tuple(int(x) for x in args.glibc.split(".")[:2])
 
 MARKER_ENV = {
-    "python_version": args.py_version,
-    "python_full_version": f"{args.py_version}.0",
+    "python_version": PY_MAJOR_MINOR,
+    "python_full_version": PY_FULL_VERSION,
     "implementation_name": "cpython",
-    "implementation_version": f"{args.py_version}.0",
+    "implementation_version": PY_FULL_VERSION,
     "platform_python_implementation": "CPython",
     "platform_machine": "armv7l",
     "platform_system": "Linux",
@@ -140,7 +144,7 @@ Path(_ENV_DIR, "pyproject.toml").write_text(
     f'''[project]
 name = "armv7-env"
 version = "0"
-requires-python = ">={args.py_version}"
+requires-python = ">={PY_FULL_VERSION}"
 
 [tool.uv]
 environments = ["sys_platform == 'linux' and platform_machine == 'armv7l'"]
