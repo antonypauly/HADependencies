@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gfortran \
     libopenblas-dev \
     pkg-config \
+    libgeos-dev \
     libsodium-dev \
     libffi-dev \
     curl \

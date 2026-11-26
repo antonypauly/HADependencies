@@ -38,5 +38,17 @@ jobs:
         with:
           path: site
 
+  # Separate deploy job: deploy-pages can read a stale artifact listing when
+  # upload + deploy run in the same job (actions/deploy-pages#451).
+  deploy-pages:
+    needs: publish-index
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - uses: actions/deploy-pages@v4
         id: deployment
